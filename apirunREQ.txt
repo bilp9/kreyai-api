@@ -1,0 +1,39 @@
+## 2️⃣ Relaunch the backend (FastAPI)
+
+From the kreyai-api folder:
+
+cd ~/projects/kreyai-api
+uvicorn app.main:app --reload --port 8000
+
+
+
+You should see:
+
+Uvicorn running on http://127.0.0.1:8000
+Application startup complete.
+
+
+### 3️⃣ Relaunch the frontend (Next.js)
+3️⃣ Relaunch the frontend (Next.js)
+
+From the kreyai-web folder:
+
+cd ~/projects/kreyai-web
+npm run dev 
+
+You should see:
+
+Local: http://localhost:3000
+
+Open : http://localhost:3000
+http://localhost:3000/verify
+
+=====
+If you hit “Address already in use”
+
+Run this once:
+
+lsof -i :8000
+kill -9 <PID>
+====
+---
