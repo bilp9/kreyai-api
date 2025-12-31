@@ -1,53 +1,20 @@
-"""
-PHASE 1 API — FROZEN CONTRACT
-
-This file defines the complete Phase 1 job lifecycle for Kreyai.
-
-Rules:
-- No new fields may be added in Phase 1
-- No request/response schema changes
-- Only comments, validation, and bug fixes are allowed
-- Any functional expansion must occur in Phase 2
-
-Phase 1 priorities:
-- Safety
-- Clarity
-- Supportability
-"""
-
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, UploadFile, File, HTTPException
 from pydantic import BaseModel, EmailStr
 from datetime import datetime
 import random
+import string
+import os
 
 router = APIRouter(prefix="/api", tags=["jobs"])
 
-# ============================================================
-# Phase 1 Canonical Job States (DO NOT MODIFY)
-# ============================================================
+# -----------------------------
+# In-memory job store (Phase 1)
+# -----------------------------
+JOBS = {}
 
-PHASE1_JOB_STATES = {
-    "created",               # Job created, awaiting verification
-    "pending_verification",  # Verification email sent
-    "verified",              # Email verified
-    "uploaded",              # File uploaded
-    "processing",            # Transcription in progress (manual/dev)
-    "completed",             # Transcript ready
-    "failed",                # Unrecoverable error
-}
-
-# ============================================================
-# In-memory store (Phase 1 only)
-# ============================================================
-
-# NOTE:
-# This is intentionally in-memory for Phase 1.
-# Persistence will be introduced in Phase 2.
-jobs_db: dict[str, dict] = {}
-
-# ============================================================
-# Models (Frozen)
-# ============================================================
+# -----------------------------
+# Models
+# -----------------------------
 
 class JobCreateRequest(BaseModel):
     email: EmailStr
@@ -59,157 +26,150 @@ class JobResponse(BaseModel):
     created_at: datetime
 
 
-# ============================================================
+class VerifyResponse(BaseModel):
+    job_id: str
+    status: str
+    verified_at: datetime
+
+
+class UploadResponse(BaseModel):
+    job_id: str
+    status: str
+    filename: str
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    created_at: datetime
+    verified_at: datetime | None = None
+    uploaded_at: datetime | None = None
+
+
+# -----------------------------
 # Helpers
-# ============================================================
+# -----------------------------
 
 def generate_job_id() -> str:
-    return f"KR-{random.randint(100000, 999999)}"
+    return "KR-" + "".join(random.choices(string.digits, k=6))
 
 
-def generate_verification_code() -> str:
-    return f"{random.randint(100000, 999999)}"
+def generate_code() -> str:
+    return "".join(random.choices(string.digits, k=6))
 
 
-def send_verification_email(email: str, job_id: str, code: str) -> None:
-    """
-    Phase 1 email delivery (DEV MODE).
-
-    In production, this will be replaced by a transactional
-    email provider. For now, output is logged for verification.
-    """
-    print(f"""
-=========================
-EMAIL VERIFICATION (DEV)
-=========================
-To: {email}
-Job ID: {job_id}
-Verification Code: {code}
-=========================
-""")
-
-
-# ============================================================
-# Endpoints
-# ============================================================
+# -----------------------------
+# Create Job
+# -----------------------------
 
 @router.post("/", response_model=JobResponse)
 def create_job(payload: JobCreateRequest):
-    """
-    Create a new transcription job.
-
-    Phase 1 notes:
-    - Email is required to establish ownership
-    - Job cannot proceed without verification
-    - Retention policy begins at creation time (7 days)
-    """
-
     job_id = generate_job_id()
-    verification_code = generate_verification_code()
-    now = datetime.utcnow()
+    code = generate_code()
 
-    jobs_db[job_id] = {
-        "job_id": job_id,
+    JOBS[job_id] = {
         "email": payload.email,
-        "verification_code": verification_code,
+        "code": code,
         "status": "pending_verification",
-        "created_at": now,
-        "file_uploaded": False,
+        "created_at": datetime.utcnow(),
+        "verified_at": None,
+        "uploaded_at": None,
+        "filename": None,
     }
 
-    send_verification_email(payload.email, job_id, verification_code)
-
-    return JobResponse(
-        job_id=job_id,
-        status="pending_verification",
-        created_at=now,
+    # DEV email simulation
+    print(
+        f"""
+        =========================
+        EMAIL VERIFICATION (DEV)
+        =========================
+        To: {payload.email}
+        Job ID: {job_id}
+        Verification Code: {code}
+        =========================
+        """
     )
 
+    return {
+        "job_id": job_id,
+        "status": "pending_verification",
+        "created_at": JOBS[job_id]["created_at"],
+    }
 
-@router.post("/verify")
-def verify_job(
-    job_id: str = Query(...),
-    code: str = Query(...)
-):
-    """
-    Verify ownership of a job via email code.
 
-    Rules:
-    - Verification can only happen once
-    - Verified jobs unlock file upload
-    """
+# -----------------------------
+# Verify Email
+# -----------------------------
 
-    job = jobs_db.get(job_id)
+@router.post("/verify", response_model=VerifyResponse)
+def verify_job(job_id: str, code: str):
+    job = JOBS.get(job_id)
+
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job["status"] == "verified":
+    if job["status"] != "pending_verification":
         raise HTTPException(status_code=400, detail="Job already verified")
 
-    if code != job["verification_code"]:
+    if job["code"] != code:
         raise HTTPException(status_code=400, detail="Invalid verification code")
 
     job["status"] = "verified"
-    return {"message": "Job verified successfully"}
+    job["verified_at"] = datetime.utcnow()
+
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "verified_at": job["verified_at"],
+    }
 
 
-@router.post("/upload")
-def upload_file(
-    job_id: str = Query(...),
-    file: UploadFile = File(...)
-):
-    """
-    Upload an audio or video file.
+# -----------------------------
+# Upload File
+# -----------------------------
 
-    Guards:
-    - Job must be verified
-    - Only one upload allowed in Phase 1
-    """
+@router.post("/upload", response_model=UploadResponse)
+def upload_file(job_id: str, file: UploadFile = File(...)):
+    job = JOBS.get(job_id)
 
-    job = jobs_db.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
     if job["status"] != "verified":
-        raise HTTPException(
-            status_code=400,
-            detail="File upload is only allowed after email verification"
-        )
+        raise HTTPException(status_code=400, detail="Job not verified")
 
-    if job["file_uploaded"]:
-        raise HTTPException(
-            status_code=400,
-            detail="File already uploaded for this job"
-        )
+    os.makedirs("app/storage", exist_ok=True)
+    file_path = f"app/storage/{job_id}_{file.filename}"
 
-    # NOTE:
-    # File is not persisted in Phase 1.
-    # Storage integration occurs in Phase 2.
-    job["file_uploaded"] = True
+    with open(file_path, "wb") as f:
+        f.write(file.file.read())
+
     job["status"] = "uploaded"
+    job["uploaded_at"] = datetime.utcnow()
+    job["filename"] = file.filename
 
-    return {"message": "File uploaded successfully"}
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "filename": file.filename,
+    }
 
 
-@router.get("/jobs/status", response_model=JobResponse)
-def job_status(job_id: str = Query(...)):
-    """
-    Read-only job status endpoint.
+# -----------------------------
+# Get Job Status (READ ONLY)
+# -----------------------------
 
-    Used by:
-    - Frontend polling
-    - Support inquiries
-    - Phase 2 UI
+@router.get("/jobs/{job_id}", response_model=JobStatusResponse)
+def get_job_status(job_id: str):
+    job = JOBS.get(job_id)
 
-    No mutation allowed.
-    """
-
-    job = jobs_db.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    return JobResponse(
-        job_id=job["job_id"],
-        status=job["status"],
-        created_at=job["created_at"],
-    )
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "verified_at": job["verified_at"],
+        "uploaded_at": job["uploaded_at"],
+    }
