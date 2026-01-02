@@ -1,9 +1,14 @@
-# macOS
+# OS
 .DS_Store
 
 # Python
 __pycache__/
 *.pyc
+*.pyo
 
-# Runtime storage (Phase 1)
+# Virtual env
+.venv/
+env/
+
+# Runtime / temp
 app/storage/

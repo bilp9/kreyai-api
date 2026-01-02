@@ -1,68 +1,60 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File, Query
+# app/routes/jobs.py
+
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from datetime import datetime
-from typing import Dict
-import random
-import string
-import os
+import uuid
 
+from app.constants import JobStatus, JOB_ID_PREFIX
+from app.events.recorder import record_event, get_events
 from app.processing.dispatcher import dispatch_job
+from app.storage.jobs_store import JOBS
 
-router = APIRouter()
+router = APIRouter(prefix="/api", tags=["jobs"])
 
-# -------------------------------------------------------------------
-# In-memory job store (Phase 1 only)
-# -------------------------------------------------------------------
+# -------------------------
+# In-memory job store (Phase-1 only)
+# -------------------------
+#JOBS: dict[str, dict] = {} #removed, and moved to jobs_storePY
 
-from app.state.jobs_store import JOBS
 
+# -------------------------
+# Create Job
+# -------------------------
+import random
 
-UPLOAD_DIR = "app/storage/uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# -------------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------------
-
-def now():
-    return datetime.utcnow()
-
-def generate_job_id():
-    return "KR-" + "".join(random.choices(string.digits, k=6))
-
-def generate_code():
-    return "".join(random.choices(string.digits, k=6))
-
-# -------------------------------------------------------------------
-# Routes
-# -------------------------------------------------------------------
+def generate_verification_code():
+    return str(random.randint(100000, 999999))
 
 @router.post("/")
 def create_job(email: str):
-    job_id = generate_job_id()
-    code = generate_code()
+    job_id = f"{JOB_ID_PREFIX}-{uuid.uuid4().hex[:6].upper()}"
+
+    code = generate_verification_code()
 
     job = {
         "job_id": job_id,
         "email": email,
-        "status": "pending_verification",
+        "status": JobStatus.PENDING_VERIFICATION,
+        "created_at": datetime.utcnow().isoformat(),
+        "verified": False,
         "verification_code": code,
-        "created_at": now(),
-        "updated_at": now(),
+        "attempts": 0,
+        "events": [],
     }
 
     JOBS[job_id] = job
 
-    # DEV email output (intentional)
+    record_event(job, "job_created", "Job created and awaiting verification")
     print(
-        f"""
-        =========================
-        EMAIL VERIFICATION (DEV)
-        =========================
-        To: {email}
-        Job ID: {job_id}
-        Verification Code: {code}
-        =========================
-        """
+    f"""
+    =========================
+    EMAIL VERIFICATION (DEV)
+    =========================
+    To: {email}
+    Job ID: {job_id}
+    Verification Code: {code}
+    =========================
+    """
     )
 
     return {
@@ -71,79 +63,106 @@ def create_job(email: str):
         "created_at": job["created_at"],
     }
 
-# -------------------------------------------------------------------
 
+# -------------------------
+# Verify Email
+# -------------------------
 @router.post("/verify")
-def verify_job(
-    job_id: str = Query(...),
-    code: str = Query(...)
-):
+def verify_job(job_id: str, code: str):
     job = JOBS.get(job_id)
+
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job["status"] != "pending_verification":
-        raise HTTPException(status_code=400, detail="Job already verified")
+    if job["verified"]:
+        return {"message": "Already verified"}
 
-    if job["verification_code"] != code:
+    if code != job.get("verification_code"):
         raise HTTPException(status_code=400, detail="Invalid verification code")
 
-    job["status"] = "verified"
-    job["updated_at"] = now()
+    job["verified"] = True
+    job["status"] = JobStatus.VERIFIED
 
-    return {
-        "job_id": job_id,
-        "status": job["status"],
-        "verified_at": job["updated_at"],
-    }
+    record_event(job, "verified", "Email verification successful")
 
-# -------------------------------------------------------------------
+    return {"message": "Verification successful"}
 
+
+# -------------------------
+# Upload File
+# -------------------------
 @router.post("/upload")
-def upload_file(
-    job_id: str = Query(...),
-    file: UploadFile = File(...)
-):
+def upload_file(job_id: str, file: UploadFile = File(...)):
     job = JOBS.get(job_id)
+
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job["status"] != "verified":
-        raise HTTPException(
-            status_code=400,
-            detail="Job must be verified before upload",
-        )
+    if not job["verified"]:
+        raise HTTPException(status_code=400, detail="Job not verified")
 
-    file_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    job["filename"] = file.filename
+    job["status"] = JobStatus.UPLOADED
+    job["progress"] = 0
+    job["updated_at"] = datetime.utcnow().isoformat()
 
-    with open(file_path, "wb") as f:
-        f.write(file.file.read())
+    record_event(job, "file_uploaded", f"File uploaded: {file.filename}")
 
-    job["file_path"] = file_path
-    job["status"] = "queued"
-    job["updated_at"] = now()
+    # Queue for processing (Phase-2 worker hook)
+    job["status"] = JobStatus.QUEUED
+    job["updated_at"] = datetime.utcnow().isoformat()
 
-    # Phase-2 groundwork hook
-    dispatch_job(job_id)
+    record_event(job, "queued", "Job queued for processing")
 
-    return {
-        "job_id": job_id,
-        "status": job["status"],
-        "uploaded_at": job["updated_at"],
-    }
+    dispatch_job(job)
 
-# -------------------------------------------------------------------
+    return {"message": "File uploaded and job queued"}
 
+
+# -------------------------
+# Read Job Status (READ-ONLY)
+# -------------------------
 @router.get("/jobs/{job_id}")
-def get_job_status(job_id: str):
+def get_job(job_id: str):
     job = JOBS.get(job_id)
+
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
     return {
         "job_id": job["job_id"],
         "status": job["status"],
-        "created_at": job.get("created_at"),
+        "progress": job.get("progress", 0),
+        "attempts": job.get("attempts", 0),
+        "created_at": job["created_at"],
         "updated_at": job.get("updated_at"),
-        "completed_at": job.get("completed_at"),
+    }
+
+
+# -------------------------
+# Read Job Events (READ-ONLY)
+# -------------------------
+@router.get("/jobs/{job_id}/events")
+def get_job_events(job_id: str):
+    job = JOBS.get(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return {
+        "job_id": job_id,
+        "events": get_events(job),
+    }
+@router.get("/jobs/{job_id}/progress")
+def get_job_progress(job_id: str):
+    job = JOBS.get(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "progress": job.get("progress", 0),
+        "attempts": job.get("attempts", 0),
     }

@@ -10,7 +10,9 @@ def process_job(job_id: str):
         return
 
     # Simulate processing lifecycle
-    job["status"] = "processing"
+    from app.state.state_manager import transition_state
+    transition_state(job, "processing")
+
     job["updated_at"] = datetime.utcnow()
 
     # Immediately complete (mock)

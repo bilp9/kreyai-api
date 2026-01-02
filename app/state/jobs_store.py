@@ -1,5 +1,2 @@
-# app/state/jobs_store.py
-
-from typing import Dict
-
-JOBS: Dict[str, dict] = {}
+# app/storage/jobs_store.py
+JOBS: dict = {}
