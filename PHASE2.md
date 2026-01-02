@@ -1,177 +1,101 @@
-# Kreyai — Phase 2 Specification
+# Kreyai — Phase 2 Technical Scope
 
-## Overview
+Phase 2 builds on the stabilized Phase 1 API and introduces
+job execution, resiliency, and processing orchestration.
 
-Phase 2 transitions Kreyai from a **validated, supportable workflow** into a
-**production-ready transcription platform**.
-
-The focus of this phase is **automation, user autonomy, and paid usage** —
-while preserving the trust, accuracy, and restraint established in Phase 1.
-
-Phase 2 does **not** aim for mass scale yet. It aims for *reliable real-world use*.
+This phase is focused on **control, observability, and safety** —
+not performance or scale.
 
 ---
 
-## Core Objectives
+## Objectives
 
-- Introduce paid usage
-- Automate transcription processing
-- Improve user experience without forcing accounts
-- Expand language and output support
-- Maintain strict privacy guarantees
-- Control infrastructure costs
-
----
-
-## Scope (Phase 2)
-
-### Included
-
-#### 1. Payments
-- Pay-per-job pricing
-- Clear cost preview before processing
-- Payment required **after verification, before processing**
-- Stripe or equivalent provider
-- No subscription requirement
-
-#### 2. Background Processing
-- Asynchronous job processing
-- FIFO queue by default
-- Concurrent processing with guardrails
-- Automatic retry on recoverable errors
-
-#### 3. Output Formats
-- Plain text transcript (default)
-- Subtitle exports:
-  - SRT
-  - VTT
-- Time-aligned transcripts (best effort)
-
-#### 4. Diarization (Optional)
-- User-selectable diarization at job creation
-- Clear disclaimer on diarization accuracy
-- No retroactive diarization without reprocessing
-- One reprocessing allowed if user forgot to enable it
-
-#### 5. Language Handling
-- Explicit language selection (optional)
-- Auto-detection remains default
-- Improved handling of:
-  - Code-switching
-  - Mixed Creole / French / English speech
-- Language list exposed in UI (non-exclusive)
-
-#### 6. Notifications
-- Email notification when job completes
-- Secure download link with expiration
-- Optional one-time access code for downloads
+- Introduce background job execution
+- Track progress and attempts
+- Handle failures deterministically
+- Prepare for real async workers
+- Keep API contracts stable
 
 ---
 
-## Job Lifecycle (Phase 2 Extension)
+## Job Lifecycle (Phase 2)
 
-Additional states introduced:
-
-| State | Description |
-|-----|-------------|
-| `awaiting_payment` | Verified but not yet paid |
-| `queued` | Awaiting processing |
-| `processing` | Actively transcribing |
-| `ready_for_download` | Output available |
-| `downloaded` | User retrieved output |
-
-All Phase 1 states remain valid.
+PENDING_VERIFICATION  
+→ VERIFIED  
+→ UPLOADED  
+→ QUEUED  
+→ PROCESSING  
+→ COMPLETED | FAILED | EXPIRED
 
 ---
 
-## Retention Policy (Phase 2)
+## New Capabilities
 
-- Default retention remains **7 days**
-- Optional paid extensions (e.g. 30 days)
-- Automatic deletion enforced
-- Clear retention countdown visible to users
+### 1. Dispatcher
+- Accepts verified + uploaded jobs
+- Moves jobs into QUEUED state
+- Hands off execution to runner
 
-Retention continues to serve **support and user access only**.
+### 2. Runner (Mock Processor)
+- Simulates processing work
+- Updates progress (0–100)
+- Supports failure simulation
+- Enforces timeout rules
+- Increments attempt count
 
----
-
-## User Accounts (Optional)
-
-Phase 2 introduces **optional accounts**, not mandatory ones.
-
-### Guest Users
-- Upload, pay, download without account
-- Email-based access only
-- Limited job history
-
-### Account Users
-- Job history dashboard
-- Faster checkout
-- Saved preferences
-- Extended retention options
-
-No dark patterns forcing account creation.
+### 3. Progress Tracking
+- `/jobs/{job_id}/progress`
+- Read-only endpoint
+- Frontend-safe polling
 
 ---
 
-## Privacy & Compliance
+## Failure & Retry Policy
 
-- Same privacy guarantees as Phase 1
-- Explicit confirmation that:
-  - Content is not sold
-  - Content is not used for training
-- GDPR-friendly deletion flow
-- Clear data ownership language
+- Maximum attempts: configurable
+- Timeout per attempt enforced
+- Failed jobs are terminal unless retried manually
+- All failures are recorded as events
 
 ---
 
-## Infrastructure (Target)
+## Constants & Guards
 
-- Cloud-based processing (GCP preferred)
-- Object storage for files
-- Stateless API services
-- Secure secrets management
-- Cost ceilings and alerts
+All limits, flags, and enums live in `constants.py`:
+- JobStatus enum
+- Upload size limits
+- Retry limits
+- Timeouts
+- Feature flags
 
-No premature multi-region deployment.
-
----
-
-## Known Non-Goals (Phase 2)
-
-Phase 2 will **not** include:
-- Real-time transcription
-- Live streaming
-- Mobile apps
-- Team collaboration features
-- Advanced analytics dashboards
-- Marketplace or API resale
-
-These are candidates for later phases.
+No magic values in route handlers.
 
 ---
 
-## Phase 2 Success Criteria
+## Out of Scope (Phase 2)
 
-Phase 2 is successful when:
-- Users can complete end-to-end paid jobs autonomously
-- Jobs process reliably without manual intervention
-- Support load is manageable
-- Costs remain predictable
-- Trust is preserved
-
----
-
-## Phase 3 (Preview)
-
-Potential future directions:
-- Enterprise plans
-- Team workspaces
-- API access for partners
-- Custom language models
-- Advanced quality review tools
-- Integration with media platforms
+- Real AI transcription
+- Cloud queues
+- Billing / payments
+- User accounts
+- Authentication beyond email verification
 
 ---
 
-**Phase 2 builds capability — not chaos.**
+## Exit Criteria
+
+Phase 2 is complete when:
+- Jobs reliably process or fail
+- Progress is observable
+- Retries and timeouts work
+- API contract is frozen
+- System is ready for async workers
+
+---
+
+## Next Phase Preview (Phase 3)
+
+- Replace mock runner with real worker
+- Introduce message queue (GCP / AWS)
+- Persistent storage
+- Production email provider
