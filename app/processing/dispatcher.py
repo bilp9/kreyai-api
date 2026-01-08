@@ -1,24 +1,16 @@
 # app/processing/dispatcher.py
-
-from app.constants import JobStatus
+import asyncio
+import threading
 from app.processing.runner import run_job
-from app.events.recorder import record_event
 
-
-def dispatch_job(job: dict):
+def dispatch_job(job_id: str):
     """
-    Dispatch a verified & uploaded job into processing.
-
-    This function is synchronous in Phase-2 groundwork.
-    It will later enqueue async workers.
+    Launch job execution in a background thread
+    with its own event loop (safe with FastAPI).
     """
 
-    # Guard
-    if job["status"] not in {JobStatus.UPLOADED, JobStatus.QUEUED}:
-        raise ValueError("Job not ready for dispatch")
+    def _run():
+        asyncio.run(run_job(job_id))
 
-    job["status"] = JobStatus.PROCESSING
-    record_event(job, "processing_started", "Job processing started")
-
-    # Run (mock / sync for now)
-    run_job(job)
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()

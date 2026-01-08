@@ -1,31 +1,62 @@
 # app/processing/runner.py
-
+import asyncio
 import time
-import random
-from app.constants import JobStatus
+
+from app.state.jobs_store import JOBS
+from app.constants import (
+    JobStatus,
+    MAX_JOB_ATTEMPTS,
+    JOB_ATTEMPT_TIMEOUT_SECONDS,
+    PROGRESS_INCREMENT,
+    PROGRESS_STEP_SECONDS,
+)
 from app.events.recorder import record_event
 
 
-def run_job(job: dict):
-    """
-    Simulated processing runner.
-    Phase-2 groundwork: progress, failure, completion.
-    """
+async def run_job(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        return
+
+    if job["attempts"] >= MAX_JOB_ATTEMPTS:
+        job["status"] = JobStatus.FAILED
+        record_event(job, "failed", "Max retry attempts reached")
+        return
+
+    job["attempts"] += 1
+    job["status"] = JobStatus.PROCESSING
+    job["progress"] = 0
+
+    record_event(job, "processing_started", f"Attempt {job['attempts']}")
+
+    start_time = time.time()
 
     try:
-        for step in range(1, 6):
-            time.sleep(1)
+        while job["progress"] < 100:
+            await asyncio.sleep(PROGRESS_STEP_SECONDS)
 
-            job["progress"] = step * 20
-            record_event(job, "progress", f"{job['progress']}% complete")
+            # timeout enforcement
+            if time.time() - start_time > JOB_ATTEMPT_TIMEOUT_SECONDS:
+                raise TimeoutError("Job processing timeout")
 
-        # Simulate random failure
-        if random.random() < 0.1:
-            raise RuntimeError("Simulated processing failure")
+            job["progress"] += PROGRESS_INCREMENT
+            job["progress"] = min(job["progress"], 100)
+
+            record_event(
+                job,
+                "progress",
+                f"{job['progress']}%",
+            )
 
         job["status"] = JobStatus.COMPLETED
         record_event(job, "completed", "Job completed successfully")
 
     except Exception as e:
-        job["status"] = JobStatus.FAILED
-        record_event(job, "failed", str(e))
+        record_event(job, "error", str(e))
+
+        if job["attempts"] < MAX_JOB_ATTEMPTS:
+            record_event(job, "retrying", "Retrying job")
+            await run_job(job_id)
+        else:
+            job["status"] = JobStatus.FAILED
+            record_event(job, "failed", "Job permanently failed")
