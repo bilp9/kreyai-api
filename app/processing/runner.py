@@ -1,6 +1,8 @@
 # app/processing/runner.py
 import asyncio
 import time
+from app.state.state_manager import transition_job
+from app.constants import JobStatus
 
 from app.state.jobs_store import JOBS
 from app.constants import (
@@ -24,7 +26,8 @@ async def run_job(job_id: str):
         return
 
     job["attempts"] += 1
-    job["status"] = JobStatus.PROCESSING
+    transition_job(job, JobStatus.PROCESSING)
+
     job["progress"] = 0
 
     record_event(job, "processing_started", f"Attempt {job['attempts']}")

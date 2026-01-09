@@ -1,4 +1,6 @@
 # app/routes/jobs.py
+from app.state.state_manager import transition_job
+
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from datetime import datetime
 import uuid
@@ -64,7 +66,8 @@ def verify_job(job_id: str, code: str):
         raise HTTPException(400, "Invalid verification code")
 
     job["verified"] = True
-    job["status"] = JobStatus.VERIFIED
+    transition_job(job, JobStatus.VERIFIED)
+
 
     record_event(job, "verified", "Email verified")
 
@@ -80,16 +83,23 @@ def upload_file(job_id: str, file: UploadFile = File(...)):
     if not job["verified"]:
         raise HTTPException(400, "Job not verified")
 
+    # Save metadata (file persistence can come later)
     job["filename"] = file.filename
-    job["status"] = JobStatus.QUEUED
     job["progress"] = 0
 
+    # 🔐 STATE TRANSITIONS (this is the missing piece)
+    transition_job(job, JobStatus.UPLOADED)
+    transition_job(job, JobStatus.QUEUED)
+
+    # 🧾 EVENTS (purely informational)
     record_event(job, "uploaded", f"File uploaded: {file.filename}")
     record_event(job, "queued", "Job queued for processing")
 
+    # 🚀 Dispatch to worker
     dispatch_job(job_id)
 
-    return {"message": "File uploaded and processing started"}
+    return {"message": "File uploaded and job queued"}
+
 
 
 @router.get("/jobs/{job_id}")
