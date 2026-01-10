@@ -1,65 +1,50 @@
 # app/processing/runner.py
 import asyncio
-import time
-from app.state.state_manager import transition_job
-from app.constants import JobStatus
+import random
+from datetime import datetime
 
+from app.constants import JobStatus
 from app.state.jobs_store import JOBS
-from app.constants import (
-    JobStatus,
-    MAX_JOB_ATTEMPTS,
-    JOB_ATTEMPT_TIMEOUT_SECONDS,
-    PROGRESS_INCREMENT,
-    PROGRESS_STEP_SECONDS,
-)
+from app.state.state_manager import transition_job
 from app.events.recorder import record_event
 
 
-async def run_job(job_id: str):
+async def run_job(job_id: str) -> None:
+    """
+    Phase-2B: Simulated processing.
+    - transitions to PROCESSING
+    - updates progress 0..100
+    - ends COMPLETED (or FAILED if simulated error)
+    """
     job = JOBS.get(job_id)
     if not job:
         return
 
-    if job["attempts"] >= MAX_JOB_ATTEMPTS:
-        job["status"] = JobStatus.FAILED
-        record_event(job, "failed", "Max retry attempts reached")
+    # Guard: only start processing from QUEUED (or UPLOADED if you're allowing that)
+    try:
+        transition_job(job, JobStatus.PROCESSING)
+    except Exception:
+        # If your transition rules are strict, make sure upload sets QUEUED before dispatch.
+        record_event(job, "runner_skipped", f"Not runnable from status={job.get('status')}")
         return
 
-    job["attempts"] += 1
-    transition_job(job, JobStatus.PROCESSING)
+    record_event(job, "processing", "Job processing started")
 
-    job["progress"] = 0
+    # Optional: simulate occasional failures (keep low for now)
+    fail_rate = float(job.get("simulate_fail_rate", 0.0))  # e.g. 0.15
+    should_fail = random.random() < fail_rate
 
-    record_event(job, "processing_started", f"Attempt {job['attempts']}")
+    # Simulate work in 10 steps
+    for step in range(1, 11):
+        await asyncio.sleep(0.4)
+        job["progress"] = step * 10
+        record_event(job, "progress", f"{job['progress']}%")
 
-    start_time = time.time()
+        if should_fail and step == 6:
+            transition_job(job, JobStatus.FAILED)
+            record_event(job, "failed", "Simulated processing failure")
+            return
 
-    try:
-        while job["progress"] < 100:
-            await asyncio.sleep(PROGRESS_STEP_SECONDS)
-
-            # timeout enforcement
-            if time.time() - start_time > JOB_ATTEMPT_TIMEOUT_SECONDS:
-                raise TimeoutError("Job processing timeout")
-
-            job["progress"] += PROGRESS_INCREMENT
-            job["progress"] = min(job["progress"], 100)
-
-            record_event(
-                job,
-                "progress",
-                f"{job['progress']}%",
-            )
-
-        job["status"] = JobStatus.COMPLETED
-        record_event(job, "completed", "Job completed successfully")
-
-    except Exception as e:
-        record_event(job, "error", str(e))
-
-        if job["attempts"] < MAX_JOB_ATTEMPTS:
-            record_event(job, "retrying", "Retrying job")
-            await run_job(job_id)
-        else:
-            job["status"] = JobStatus.FAILED
-            record_event(job, "failed", "Job permanently failed")
+    transition_job(job, JobStatus.COMPLETED)
+    job["completed_at"] = datetime.utcnow().isoformat()
+    record_event(job, "completed", "Job completed successfully")

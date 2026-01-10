@@ -1,15 +1,14 @@
+# app/main.py
 from fastapi import FastAPI
+import asyncio
+
 from app.routes import jobs
+from app.processing.worker import worker_loop
 
-app = FastAPI(
-    title="Kreyai API",
-    description="Secure transcription job service",
-    version="0.1.0"
-)
+app = FastAPI()
+app.include_router(jobs.router)
 
-app.include_router(jobs.router, prefix="/api")
-
-
-@app.get("/")
-def root():
-    return {"status": "Kreyai API running"}
+@app.on_event("startup")
+async def startup_event():
+    # Worker lives inside FastAPI's event loop.
+    asyncio.create_task(worker_loop())

@@ -1,11 +1,23 @@
 # app/state/state_manager.py
+
+from app.constants import JobStatus
 from app.state.job_transitions import ALLOWED_TRANSITIONS
 
-def transition_job(job: dict, new_status):
+
+def can_transition(from_status: JobStatus, to_status: JobStatus) -> bool:
+    """
+    Check whether a job is allowed to move from one state to another.
+    """
+    return to_status in ALLOWED_TRANSITIONS.get(from_status, set())
+
+
+def transition_job(job: dict, new_status: JobStatus):
+    """
+    Transition a job to a new status if allowed by the lifecycle rules.
+    """
     current = job["status"]
 
-    allowed = ALLOWED_TRANSITIONS.get(current, set())
-    if new_status not in allowed:
+    if not can_transition(current, new_status):
         raise RuntimeError(
             f"Invalid job transition: {current} → {new_status}"
         )
