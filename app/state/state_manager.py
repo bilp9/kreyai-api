@@ -1,3 +1,6 @@
+# app/state/state_manager.py
+from __future__ import annotations
+
 from app.constants import JobStatus
 from app.state.job_transitions import ALLOWED_TRANSITIONS
 

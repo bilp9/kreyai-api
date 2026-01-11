@@ -1,14 +1,12 @@
 """
 Kreyai — Global Constants
 
-Single source of truth for:
-- Job lifecycle
-- Processing limits
-- Retry + timeout policy
-- Feature flags
+System-wide limits, enums, and flags.
+Safe to import anywhere (routes, services, workers).
 
 Phase-1 compatible
-Phase-2 (A/B/C) stable
+Phase-2 ready
+Phase-3 ready (local durable queue)
 """
 
 from enum import Enum
@@ -30,49 +28,16 @@ class JobStatus(str, Enum):
 
 
 # =========================
-# Job ID
-# =========================
-
-JOB_ID_PREFIX = "KR"
-
-
-# =========================
-# Retry + Timeout Policy
-# =========================
-
-# Max number of processing attempts
-MAX_JOB_ATTEMPTS = 3
-
-# Per-attempt processing timeout (seconds)
-JOB_ATTEMPT_TIMEOUT_SECONDS = 30
-
-
-# =========================
-# Progress Simulation
-# =========================
-
-# Deterministic progress steps for UI + testing
-PROGRESS_STEPS = [10, 30, 60, 90, 100]
-
-
-# =========================
 # File & Upload Limits
 # =========================
 
-# Phase-2 target: large media support
+# Maximum upload size (target: 1–2 GB)
 MAX_UPLOAD_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
+# Allowed file extensions (audio + video)
 ALLOWED_EXTENSIONS = {
-    ".wav",
-    ".mp3",
-    ".m4a",
-    ".aac",
-    ".flac",
-    ".ogg",
-    ".mp4",
-    ".mov",
-    ".mkv",
-    ".webm",
+    ".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg",
+    ".mp4", ".mov", ".mkv", ".webm",
 }
 
 
@@ -107,3 +72,40 @@ FEATURE_MULTI_LANGUAGE_ENABLED = True
 
 TEXT_OUTPUT_FORMATS = {"txt", "json"}
 SUBTITLE_FORMATS = {"srt", "vtt"}
+
+
+# =========================
+# Misc
+# =========================
+
+JOB_ID_PREFIX = "KR"
+
+
+# =========================
+# Phase-3A: Local Durable Queue
+# =========================
+
+# SQLite db file for queue durability
+QUEUE_DB_PATH = "app/storage/queue/queue.db"
+
+# How long a lease lasts before the job can be reclaimed
+QUEUE_LEASE_SECONDS = 60
+
+# Maximum number of times a job can be leased/attempted at the queue level
+QUEUE_MAX_ATTEMPTS = 3
+
+# Worker polling interval (used later in Phase-3A worker loop)
+WORKER_POLL_SECONDS = 1.0
+
+# =========================
+# Phase-3A: Worker + Retry + Timeout
+# =========================
+
+# Per-attempt timeout while processing a job
+PROCESS_ATTEMPT_TIMEOUT_SECONDS = 30
+
+# How many processing attempts before we mark the job FAILED permanently
+PROCESS_MAX_ATTEMPTS = 3
+
+# Worker polling interval
+WORKER_POLL_SECONDS = 1.0

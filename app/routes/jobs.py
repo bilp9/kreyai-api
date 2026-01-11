@@ -1,6 +1,7 @@
+# app/routes/jobs.py
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from datetime import datetime
 import uuid
-from fastapi import APIRouter, HTTPException, UploadFile, File
 
 from app.constants import JobStatus, JOB_ID_PREFIX
 from app.state.jobs_store import JOBS
@@ -25,13 +26,11 @@ def create_job(email: str):
         "created_at": datetime.utcnow().isoformat(),
         "attempts": 0,
         "progress": 0,
-        "last_error": None,
         "events": [],
     }
 
     JOBS[job_id] = job
 
-    # DEV: print code so you can test in Swagger
     print(
         f"""
 =========================
@@ -46,7 +45,11 @@ Verification Code: {code}
 
     record_event(job, "job_created", "Awaiting verification")
 
-    return {"job_id": job_id, "status": job["status"], "created_at": job["created_at"]}
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "created_at": job["created_at"],
+    }
 
 
 @router.post("/verify")
@@ -74,24 +77,21 @@ def upload_file(job_id: str, file: UploadFile = File(...)):
     if not job:
         raise HTTPException(404, "Job not found")
 
-    if not job.get("verified"):
+    if not job["verified"]:
         raise HTTPException(400, "Job not verified")
 
-    # VERIFIED -> UPLOADED
+    # Update job metadata
     job["filename"] = file.filename
     job["progress"] = 0
-    job["last_error"] = None
+
+    # VERIFIED -> UPLOADED
     transition_job(job, JobStatus.UPLOADED)
     record_event(job, "uploaded", f"File uploaded: {file.filename}")
 
-    # UPLOADED -> QUEUED
-    transition_job(job, JobStatus.QUEUED)
-    record_event(job, "queued", "Job queued for processing")
-
-    # Dispatch background processing
+    # UPLOADED -> QUEUED + enqueue durable work item
     dispatch_job(job_id)
 
-    return {"message": "File uploaded and queued", "job_id": job_id}
+    return {"message": "File uploaded and job queued"}
 
 
 @router.get("/jobs/{job_id}")
@@ -105,7 +105,6 @@ def get_job(job_id: str):
         "status": job["status"],
         "attempts": job.get("attempts", 0),
         "progress": job.get("progress", 0),
-        "last_error": job.get("last_error"),
     }
 
 
@@ -115,7 +114,11 @@ def get_progress(job_id: str):
     if not job:
         raise HTTPException(404, "Job not found")
 
-    return {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 0)}
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "progress": job.get("progress", 0),
+    }
 
 
 @router.get("/jobs/{job_id}/events")

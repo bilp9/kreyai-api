@@ -1,15 +1,24 @@
-# app/queueing/base.py
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
+from typing import Optional
 
-
-class QueueClient(ABC):
-    @abstractmethod
-    def enqueue(self, payload: Dict[str, Any]) -> str:
-        """Returns a task_id / message_id."""
-        raise NotImplementedError
+class JobQueue(ABC):
 
     @abstractmethod
-    def dequeue(self, timeout_seconds: int = 1) -> Optional[Dict[str, Any]]:
-        """Returns payload or None if empty."""
-        raise NotImplementedError
+    def enqueue(self, job_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def lease(self) -> Optional[str]:
+        """
+        Return a job_id if available and lock it.
+        Return None if no work is available.
+        """
+        ...
+
+    @abstractmethod
+    def complete(self, job_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def fail(self, job_id: str, reason: str) -> None:
+        ...
