@@ -1,20 +1,12 @@
 # app/main.py
-#=====================================
+# =====================================
 # PUBLIC API v1 — FROZEN
-# Do not change without version bump
-#======================================
+# =====================================
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from pathlib import Path
 import sys
-
-from app.routes import jobs
-from app.middleware.rate_limit import RateLimitMiddleware
-from app.middleware.rate_limit import RateLimitHeadersMiddleware
-
-app.add_middleware(RateLimitHeadersMiddleware)
-
 
 # -------------------------------------------------
 # Runtime guard
@@ -25,36 +17,44 @@ if sys.version_info >= (3, 13):
     )
 
 # -------------------------------------------------
-# App
+# App (MUST come first)
 # -------------------------------------------------
 app = FastAPI(
     title="KreyAI Transcription API",
     version="1.0.0",
 )
 
+# -------------------------------------------------
+# Middleware
+# -------------------------------------------------
+from app.middleware.rate_limit import (
+    RateLimitMiddleware,
+    RateLimitHeadersMiddleware,
+)
+from app.middleware.auth import APIKeyAuthMiddleware
+
+app.add_middleware(RateLimitHeadersMiddleware)
+
 app.add_middleware(
     RateLimitMiddleware,
     rpm=120,
 )
 
-app.include_router(jobs.router)
-app.include_router(upload.router)
-
-
-
-from app.middleware.auth import APIKeyAuthMiddleware
-
 app.add_middleware(APIKeyAuthMiddleware)
 
+# -------------------------------------------------
+# Routes
+# -------------------------------------------------
+from app.routes import jobs, upload
+
+app.include_router(jobs.router)
+app.include_router(upload.router)
 
 # -------------------------------------------------
 # Serve frozen OpenAPI YAML (v1)
 # -------------------------------------------------
 @app.get("/openapi.yaml", include_in_schema=False)
 def openapi_yaml():
-    """
-    Serve the frozen OpenAPI v1 spec.
-    """
     path = Path("docs/openapi.yaml")
     if not path.exists():
         raise RuntimeError("docs/openapi.yaml not found")
