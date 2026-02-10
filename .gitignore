@@ -1,14 +1,16 @@
-# OS
-.DS_Store
-
 # Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 
 # Virtual env
 .venv/
-env/
+.env
 
-# Runtime / temp
-app/storage/
+# OS
+.DS_Store
+
+# Local runtime
+queue.db
+data/*.json
