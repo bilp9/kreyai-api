@@ -3,10 +3,12 @@
 # PUBLIC API v1 — FROZEN
 # =====================================
 
+import os
+import sys
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
-from pathlib import Path
-import sys
 
 # -------------------------------------------------
 # Runtime guard
@@ -17,12 +19,19 @@ if sys.version_info >= (3, 13):
     )
 
 # -------------------------------------------------
-# App (MUST come first)
+# App (MUST be created early)
 # -------------------------------------------------
 app = FastAPI(
     title="KreyAI Transcription API",
     version="1.0.0",
 )
+
+# -------------------------------------------------
+# Health check (REQUIRED for Cloud Run)
+# -------------------------------------------------
+@app.get("/health", include_in_schema=False)
+def health():
+    return {"status": "ok"}
 
 # -------------------------------------------------
 # Middleware
@@ -33,13 +42,16 @@ from app.middleware.rate_limit import (
 )
 from app.middleware.auth import APIKeyAuthMiddleware
 
+# Headers-only middleware (safe)
 app.add_middleware(RateLimitHeadersMiddleware)
 
+# Rate limiting (API routes only)
 app.add_middleware(
     RateLimitMiddleware,
     rpm=120,
 )
 
+# API key auth
 app.add_middleware(APIKeyAuthMiddleware)
 
 # -------------------------------------------------
@@ -69,6 +81,14 @@ def openapi_yaml():
 # -------------------------------------------------
 @app.on_event("startup")
 def start_reaper():
+    """
+    IMPORTANT:
+    Cloud Run MUST NOT run infinite background threads.
+    """
+    if os.getenv("KREYAI_ENV") == "cloudrun":
+        print("⏭️ Reaper disabled on Cloud Run")
+        return
+
     import threading
     import time
     from app.maintenance.reaper import reap_stuck_jobs
@@ -81,7 +101,6 @@ def start_reaper():
                     print(f"🧹 Reaper recovered {count} stuck job(s)")
             except Exception as e:
                 print(f"🔥 Reaper error: {e}")
-
             time.sleep(10)
 
     threading.Thread(target=loop, daemon=True).start()
