@@ -79,6 +79,15 @@ def openapi_yaml():
 # -------------------------------------------------
 # Background maintenance
 # -------------------------------------------------
+@app.get("/health", include_in_schema=False)
+def health():
+    return {
+        "status": "ok",
+        "service": "kreyai-api",
+        "version": "1.0.0",
+    }
+
+
 @app.on_event("startup")
 def start_reaper():
     """
@@ -104,3 +113,4 @@ def start_reaper():
             time.sleep(10)
 
     threading.Thread(target=loop, daemon=True).start()
+

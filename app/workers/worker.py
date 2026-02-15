@@ -1,30 +1,17 @@
 # app/workers/worker.py
-import time
-import uuid
 
-from app.processing.runner import process_next_job
+import os
+import asyncio
 
-WORKER_ID = f"worker-{uuid.uuid4().hex[:6]}"
+from app.processing.runner import run_job
 
+def main():
+    job_id = os.environ.get("JOB_ID")
 
-def worker_loop():
-    print(f"🟢 Worker {WORKER_ID} started")
+    if not job_id:
+        raise RuntimeError("JOB_ID not provided to worker")
 
-    while True:
-        try:
-            did_work = process_next_job(WORKER_ID)
-
-            if not did_work:
-                time.sleep(1)
-
-        except KeyboardInterrupt:
-            print(f"🛑 Worker {WORKER_ID} stopping")
-            break
-
-        except Exception as e:
-            print(f"🔥 Worker error: {e}")
-            time.sleep(2)
-
+    asyncio.run(run_job(job_id))
 
 if __name__ == "__main__":
-    worker_loop()
+    main()

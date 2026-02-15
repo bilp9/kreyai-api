@@ -13,4 +13,4 @@ __pycache__/
 
 # Local runtime
 queue.db
-data/*.json
+

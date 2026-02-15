@@ -1,0 +1,23 @@
+# app/storage/lexicon_base.txt
+bon
+ann
+pale
+klè
+jodi
+a
+mwen
+leve
+è
+nan
+pou
+m
+n
+ap
+te
+pral
+ale
+vini
+lakay
+bagay
+teknoloji
+...

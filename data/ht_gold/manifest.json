@@ -1,0 +1,17 @@
+{
+    "version": "1.0",
+    "language": "ht",
+    "entries": [
+      {
+        "id": "ht_gold_interview_pilon_001",
+        "file": "ht_gold_interview_pilon_001.txt",
+        "domain": "interview",
+        "topic": "traditional crafts / pilon",
+        "speaker_count": 1,
+        "register": "informal",
+        "verified_by_human": true,
+        "notes": "Interview with artisan in Saut-Mathurine. Manually corrected."
+      }
+    ]
+  }
+  

@@ -1,44 +1,84 @@
+# app/transcription/lexical.py
+from __future__ import annotations
+
+from app.transcription.dictionary_loader import load_dictionary
+from typing import Dict, List, Tuple
 import re
-from typing import Tuple, List
 
 
-# Fillers to remove when isolated or sentence-initial
-FILLER_PATTERNS = [
-    r"\b(euh+|uh+|um+|hmm+)\b",
-    r"^(bon|alò|donk|donc)\b[, ]*",
-    r"\b(you know|like)\b",
-]
+# -------------------------------------------------------------------
+# High-confidence lexical corrections only
+# ❗ No grammar logic here — just word-level fixes
+# -------------------------------------------------------------------
+LEXICAL_MAP: Dict[str, str] = {
+    # discourse / fillers
+    r"\bhan\b": "ann",
+    r"\bpar le\b": "pale",
+    r"\bklè\b": "klè",
 
-# Repeated word pattern (false starts)
-REPEATED_WORD_PATTERN = r"\b(\w+)\s+\1\b"
+    # time / numbers
+    r"\bjodia\b": "jodi a",
+    r"\bhe\b": "è",
+    r"\bkektan\b": "kèk tan",
+
+    # common nouns
+    r"\bbagai\b": "bagay",
+    r"\bapplication\b": "aplikasyon",
+    r"\btechnologie\b": "teknoloji",
+    r"\bblackout\b": "blackout",
+
+    # verbs / expressions
+    r"\bditet\b": "di tèt",
+    r"\bmwen ditet mwen\b": "mwen di tèt mwen",
+    r"\bcheke\b": "tcheke",
+    r"\bman dem\b": "mande",
+    r"\brepon\b": "reponn",
+
+    # places / structures
+    r"\blakai\b": "lakay",
+    r"\blakala\b": "lakay la",
+
+    # tech terms (keep English but normalize)
+    r"\bencryption app rest\b": "encryption at rest",
+    r"\bencryption and transit\b": "encryption in transit",
+}
 
 
-def normalize_lexical_noise(text: str) -> Tuple[str, List[str]]:
+def apply_lexical_bias(text: str) -> Tuple[str, List[str]]:
     """
-    A2 — Lexical cleanup
-    Removes fillers, hesitations, and false-start repetitions
+    Apply deterministic lexical corrections.
+    Returns (corrected_text, change_log)
     """
-    log = []
-    original = text
+    log: List[str] = []
+    out = text
 
-    # Remove fillers
-    for pattern in FILLER_PATTERNS:
-        new_text = re.sub(pattern, "", text, flags=re.IGNORECASE)
-        if new_text != text:
-            log.append(f"removed filler: '{text}' → '{new_text.strip()}'")
-            text = new_text
+    # ---------------------------------------------------------------
+    # 1. Rule-based lexical normalization (highest confidence)
+    # ---------------------------------------------------------------
+    for pattern, replacement in LEXICAL_MAP.items():
+        new = re.sub(pattern, replacement, out, flags=re.IGNORECASE)
+        if new != out:
+            log.append(f"{pattern} → {replacement}")
+            out = new
 
-    # Collapse repeated words (false starts)
-    while re.search(REPEATED_WORD_PATTERN, text):
-        new_text = re.sub(REPEATED_WORD_PATTERN, r"\1", text)
-        if new_text != text:
-            log.append(f"collapsed repetition: '{text}' → '{new_text}'")
-            text = new_text
+    # ---------------------------------------------------------------
+    # 2. Dictionary-backed normalization (data-driven)
+    # ---------------------------------------------------------------
+    dictionary = load_dictionary()
 
-    # Normalize whitespace
-    new_text = re.sub(r"\s+", " ", text).strip()
-    if new_text != text:
-        log.append("normalized whitespace")
-        text = new_text
+    for raw, entry in dictionary.items():
+        normalized = entry.get("normalized")
+        if not normalized:
+            continue
 
-    return text, log
+        pattern = rf"\b{re.escape(raw)}\b"
+        if re.search(pattern, out, flags=re.IGNORECASE):
+            out = re.sub(pattern, normalized, out, flags=re.IGNORECASE)
+            log.append(f"{raw} → {normalized} (dict)")
+
+    # ---------------------------------------------------------------
+    # 3. Whitespace normalization (final cleanup)
+    # ---------------------------------------------------------------
+    out = re.sub(r"\s+", " ", out).strip()
+
+    return out, log

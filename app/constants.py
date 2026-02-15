@@ -102,7 +102,7 @@ WORKER_POLL_SECONDS = 1.0
 # =========================
 
 # Per-attempt timeout while processing a job
-PROCESS_ATTEMPT_TIMEOUT_SECONDS = 30
+PROCESS_ATTEMPT_TIMEOUT_SECONDS = 1
 
 # How many processing attempts before we mark the job FAILED permanently
 PROCESS_MAX_ATTEMPTS = 3

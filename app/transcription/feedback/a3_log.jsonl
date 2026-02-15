@@ -1,0 +1,9 @@
+{
+    "rule": "A3r: tojou → toujou",
+    "before": "tojou",
+    "after": "toujou",
+    "context": seg["text"],
+    "speaker_ht_density": speaker_ht_density,
+    "window_ht_density": window_avg_ht,
+    "confidence": seg.get("avg_logprob"),
+}
