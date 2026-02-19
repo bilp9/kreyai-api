@@ -1,92 +1,107 @@
-from pathlib import Path
-from typing import BinaryIO
 import os
-
+import datetime
+import google.auth
+from google.auth.transport.requests import Request
 from google.cloud import storage
 
-# --------------------------------------
-# ENV Detection
-# --------------------------------------
 
-ENV = os.getenv("KREYAI_ENV", "local")
+class GCSStorage:
+    """
+    Production-grade Google Cloud Storage backend.
 
-# If using GCS
-GCS_BUCKET_NAME = os.getenv("KREYAI_GCS_BUCKET", "kreyai-jobs-prod")
+    - Uses Cloud Run service account
+    - No JSON key files
+    - IAM-based V4 signed URLs
+    """
 
-
-class StorageBackend:
-    def save_upload(self, job_id: str, filename: str, file_obj: BinaryIO) -> str:
-        raise NotImplementedError
-
-    def save_output(self, job_id: str, filename: str, data: bytes) -> str:
-        raise NotImplementedError
-
-    def get_download_url(self, job_id: str, filename: str) -> str:
-        raise NotImplementedError
-
-
-# --------------------------------------
-# LOCAL STORAGE
-# --------------------------------------
-
-class LocalStorage(StorageBackend):
-    BASE_DIR = Path("app/storage")
-
-    def save_upload(self, job_id: str, filename: str, file_obj: BinaryIO) -> str:
-        upload_dir = self.BASE_DIR / "uploads" / job_id
-        upload_dir.mkdir(parents=True, exist_ok=True)
-
-        path = upload_dir / filename
-        with open(path, "wb") as f:
-            f.write(file_obj.read())
-
-        return str(path)
-
-    def save_output(self, job_id: str, filename: str, data: bytes) -> str:
-        output_dir = self.BASE_DIR / "outputs" / job_id
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        path = output_dir / filename
-        path.write_bytes(data)
-
-        return str(path)
-
-    def get_download_url(self, job_id: str, filename: str) -> str:
-        return f"/api/jobs/{job_id}/{filename}"
-
-
-# --------------------------------------
-# GCS STORAGE
-# --------------------------------------
-
-class GCSStorage(StorageBackend):
     def __init__(self):
-        self.client = storage.Client()
-        self.bucket = self.client.bucket(GCS_BUCKET_NAME)
+        self.bucket_name = os.environ.get("GCS_BUCKET")
+        if not self.bucket_name:
+            raise RuntimeError("GCS_BUCKET environment variable not set")
 
-    def save_upload(self, job_id: str, filename: str, file_obj: BinaryIO) -> str:
-        blob_path = f"jobs/{job_id}/uploads/{filename}"
+        self.client = storage.Client()
+        self.bucket = self.client.bucket(self.bucket_name)
+
+    # -----------------------------
+    # PATH HELPERS
+    # -----------------------------
+
+    def upload_blob_path(self, job_id: str, filename: str) -> str:
+        return f"jobs/{job_id}/uploads/{filename}"
+
+    def output_blob_path(self, job_id: str, filename: str) -> str:
+        return f"jobs/{job_id}/outputs/{filename}"
+
+    # -----------------------------
+    # UPLOAD
+    # -----------------------------
+
+    def upload_file(self, job_id: str, file_obj, filename: str):
+        """
+        Upload user file to:
+        jobs/{job_id}/uploads/{filename}
+        """
+        blob_path = self.upload_blob_path(job_id, filename)
         blob = self.bucket.blob(blob_path)
         blob.upload_from_file(file_obj)
         return blob_path
 
-    def save_output(self, job_id: str, filename: str, data: bytes) -> str:
-        blob_path = f"jobs/{job_id}/outputs/{filename}"
+    def upload_output_file(self, job_id: str, local_path: str, filename: str):
+        """
+        Upload worker output file to:
+        jobs/{job_id}/outputs/{filename}
+        """
+        blob_path = self.output_blob_path(job_id, filename)
         blob = self.bucket.blob(blob_path)
-        blob.upload_from_string(data)
+        blob.upload_from_filename(local_path)
         return blob_path
 
+    # -----------------------------
+    # DOWNLOAD URL (IAM SIGNING)
+    # -----------------------------
+
     def get_download_url(self, job_id: str, filename: str) -> str:
-        blob_path = f"jobs/{job_id}/outputs/{filename}"
+        """
+        Create V4 signed download URL using IAM signing.
+        Works in Cloud Run without private key files.
+        """
+
+        blob_path = self.output_blob_path(job_id, filename)
         blob = self.bucket.blob(blob_path)
-        return blob.generate_signed_url(expiration=3600)
+
+        if not blob.exists():
+            raise RuntimeError(f"GCS file not found: {blob_path}")
+
+        # Get Cloud Run credentials
+        credentials, _ = google.auth.default()
+        credentials.refresh(Request())
+
+        # IMPORTANT:
+        # If credentials.service_account_email fails,
+        # replace it with your actual service account email.
+        service_account_email = getattr(
+            credentials,
+            "service_account_email",
+            "98057750771-compute@developer.gserviceaccount.com",
+        )
+
+        url = blob.generate_signed_url(
+            version="v4",
+            expiration=datetime.timedelta(hours=1),
+            method="GET",
+            service_account_email=service_account_email,
+            access_token=credentials.token,
+        )
+
+        return url
+        
+
+# Singleton storage instance
+_storage_instance = None
 
 
-# --------------------------------------
-# Factory
-# --------------------------------------
-
-def get_storage() -> StorageBackend:
-    if ENV == "cloudrun":
-        return GCSStorage()
-    return LocalStorage()
+def get_storage():
+    global _storage_instance
+    if _storage_instance is None:
+        _storage_instance = GCSStorage()
+    return _storage_instance

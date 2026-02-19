@@ -2,20 +2,52 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# -----------------------------
+# System Dependencies
+# -----------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgomp1 \
+    wget \
+    ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
+# -----------------------------
+# Environment
+# -----------------------------
+ENV PYTHONUNBUFFERED=1
+ENV HF_HOME=/app/.hf
+ENV TRANSFORMERS_CACHE=/app/.hf
+ENV HF_HUB_DISABLE_TELEMETRY=1
+ENV GCS_BUCKET=kreyai-uploads
+ENV WHISPER_MODEL_PATH=/app/models/base
+
+RUN mkdir -p /app/.hf
+RUN mkdir -p /app/models/base
+
+# -----------------------------
+# Python Dependencies
+# -----------------------------
 COPY requirements.txt .
 RUN pip install --no-cache-dir -U pip \
   && pip install --no-cache-dir -r requirements.txt
 
+# -----------------------------
+# Pre-download Whisper Model (LOCAL ONLY)
+# -----------------------------
+RUN wget -q https://huggingface.co/Systran/faster-whisper-base/resolve/main/model.bin -O /app/models/base/model.bin \
+ && wget -q https://huggingface.co/Systran/faster-whisper-base/resolve/main/config.json -O /app/models/base/config.json \
+ && wget -q https://huggingface.co/Systran/faster-whisper-base/resolve/main/vocabulary.txt -O /app/models/base/vocabulary.txt \
+ && wget -q https://huggingface.co/Systran/faster-whisper-base/resolve/main/tokenizer.json -O /app/models/base/tokenizer.json
+
+# -----------------------------
+# Copy App
+# -----------------------------
 COPY app ./app
-COPY docs ./docs
 COPY data ./data
+COPY docs ./docs
 
-ENV PORT=8080
-
-# worker doesn't need to listen on 8080
-CMD ["python", "-m", "app.workers.cloudrun_worker"]
+# -----------------------------
+# Start Worker
+# -----------------------------
+CMD ["python", "-m", "app.workers.worker"]

@@ -9,3 +9,5 @@ gunicorn
 google-cloud-storage
 python-docx
 google-cloud-firestore
+google-cloud-run
+huggingface_hub

@@ -17,6 +17,10 @@ from enum import Enum
 # =========================
 
 class JobStatus(str, Enum):
+    """
+    Inheriting from 'str' ensures JobStatus.QUEUED == "queued"
+    This allows Firestore queries to match correctly against string data.
+    """
     PENDING_VERIFICATION = "pending_verification"
     VERIFIED = "verified"
     UPLOADED = "uploaded"
@@ -102,10 +106,8 @@ WORKER_POLL_SECONDS = 1.0
 # =========================
 
 # Per-attempt timeout while processing a job
-PROCESS_ATTEMPT_TIMEOUT_SECONDS = 1
+PROCESS_ATTEMPT_TIMEOUT_SECONDS = 60 * 30  # 30 minutes
+
 
 # How many processing attempts before we mark the job FAILED permanently
 PROCESS_MAX_ATTEMPTS = 3
-
-# Worker polling interval
-WORKER_POLL_SECONDS = 1.0

@@ -1,5 +1,3 @@
-# app/transcription/engine.py
-
 # =================================================
 # KreyAI Transcription Engine — API v1 (FROZEN)
 # Any breaking change requires v2
@@ -7,11 +5,12 @@
 
 from __future__ import annotations
 
+import os
+import json
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any, Tuple, Union
+from typing import Optional, List, Dict, Any
 from collections import deque
 from pathlib import Path
-import json
 
 from faster_whisper import WhisperModel
 
@@ -124,7 +123,6 @@ class TranscriptionConfig:
     no_repeat_ngram_size: int = 3
 
     initial_prompt: Optional[str] = None
-
     a3_window_segments: int = 6
 
 
@@ -137,8 +135,10 @@ _MODEL: Optional[WhisperModel] = None
 def _get_model(cfg: TranscriptionConfig) -> WhisperModel:
     global _MODEL
     if _MODEL is None:
+        model_path = os.getenv("WHISPER_MODEL_PATH", cfg.model_size)
+
         _MODEL = WhisperModel(
-            cfg.model_size,
+            model_path,
             device=cfg.device,
             compute_type=cfg.compute_type,
         )
@@ -168,17 +168,27 @@ def _window_gate(metrics: Dict[str, Any]) -> str:
 def transcribe_audio(
     audio_path: str,
     cfg: Optional[TranscriptionConfig] = None,
+    progress_cb=None,
     *,
     debug: bool = False,
-) -> Union[str, Tuple[str, Dict[str, Any]]]:
+) -> Dict[str, Any]:
 
     cfg = cfg or TranscriptionConfig(initial_prompt=HT_DECODING_PROMPT)
+
+    def _progress(pct: int, msg: str):
+        if callable(progress_cb):
+            try:
+                progress_cb(int(pct), str(msg))
+            except Exception:
+                pass
+
+    _progress(10, "Loading model")
     model = _get_model(cfg)
     akademi = _load_akademi()
-
     metrics = PipelineMetrics()
 
-    segments, _ = model.transcribe(
+    _progress(20, "Transcribing audio")
+    segments_iter, _info = model.transcribe(
         audio_path,
         language=cfg.language,
         beam_size=cfg.beam_size,
@@ -195,29 +205,44 @@ def transcribe_audio(
     )
 
     raw_segments: List[Dict[str, Any]] = []
-    for idx, seg in enumerate(segments):
-        if not seg.text:
+    segments_list: List[Dict[str, Any]] = []
+
+    for idx, seg in enumerate(segments_iter):
+        if not getattr(seg, "text", None):
             continue
+
+        text = seg.text.strip()
+
         raw_segments.append(
             {
                 "segment_index": idx,
-                "raw_text": seg.text.strip(),
-                "text": seg.text.strip(),
-                "avg_logprob": seg.avg_logprob,
-                "hallucinated": bool(is_hallucinated(seg.text)),
+                "raw_text": text,
+                "text": text,
+                "avg_logprob": getattr(seg, "avg_logprob", None),
+                "hallucinated": bool(is_hallucinated(text)),
+            }
+        )
+
+        segments_list.append(
+            {
+                "start": float(getattr(seg, "start", 0.0)),
+                "end": float(getattr(seg, "end", 0.0)),
+                "text": text,
             }
         )
 
     if not raw_segments:
-        return ("", {}) if debug else ""
+        _progress(100, "No speech detected")
+        return {"text": "", "segments": []}
 
+    _progress(35, "Post-processing (confidence gates)")
     split_segments_by_confidence(raw_segments)
+
     for seg in raw_segments:
         seg["low_confidence"] = is_low_confidence(seg)
 
-    # -------------------------------------------------
-    # Speaker HT density
-    # -------------------------------------------------
+    _progress(45, "Computing HT density")
+
     speaker_hits = []
     for seg in raw_segments:
         d = compute_ht_density(seg["raw_text"])
@@ -227,12 +252,11 @@ def transcribe_audio(
     speaker_ht_density = sum(speaker_hits) / max(1, len(speaker_hits))
     speaker_mode = _speaker_gate(speaker_ht_density)
 
-    # -------------------------------------------------
-    # First pass (NO A3)
-    # -------------------------------------------------
+    _progress(60, "Linguistic normalization (pass 1)")
+
     for seg in raw_segments:
         text = seg["text"]
-        confidence = seg["avg_logprob"]
+        confidence = seg.get("avg_logprob")
 
         if akademi and cfg.language == "ht":
             text = akademi.normalize_text(text)
@@ -246,25 +270,14 @@ def transcribe_audio(
         text, _ = apply_contextual_corrections(text, confidence=confidence)
         text, _ = apply_lexical_corrections(text)
 
-        text, _ = apply_lexical_bias(text)
-        text, _ = normalize_verb_phrases(text)
-        text, _ = normalize_pronoun_tma(text)
-        text, _ = apply_contextual_corrections(text, confidence=confidence)
-        text, _ = apply_lexical_corrections(text)
-
-    # -----------------------------------------
-    # Akademi normalization (read-only, late)
-    # -----------------------------------------
         ak = _load_akademi()
         if ak:
             text = ak.normalize_text(text)
 
         seg["text"] = text
 
+    _progress(75, "A3 window corrections")
 
-    # -------------------------------------------------
-    # Windowed A3
-    # -------------------------------------------------
     window = deque(maxlen=cfg.a3_window_segments)
     a3_events: List[A3Event] = []
     promo_db = load_promotion_db()
@@ -307,37 +320,33 @@ def transcribe_audio(
 
     save_promotion_db(promo_db)
 
-    # -------------------------------------------------
-    # Join + format
-    # -------------------------------------------------
+    _progress(88, "Formatting output")
+
     joined = " ".join(seg["text"] for seg in raw_segments)
     joined, _ = resolve_tech_phrases(joined, confidence=None)
     final_text = apply_formatting(joined).strip()
 
-    # -------------------------------------------------
-    # A3 reversal detection
-    # -------------------------------------------------
-    reversed_events = detect_a3_reversals(
-        a3_events=a3_events,
-        final_text=final_text,
-    )
+    for i in range(min(len(segments_list), len(raw_segments))):
+        segments_list[i]["text"] = raw_segments[i]["text"]
+
+    reversed_events = detect_a3_reversals(a3_events=a3_events, final_text=final_text)
 
     if reversed_events:
-        db = load_promotion_db()
+        dbp = load_promotion_db()
         for ev in reversed_events:
-            record_reversal(db, rule_id=ev.rule_id)
-        save_promotion_db(db)
+            record_reversal(dbp, rule_id=ev.rule_id)
+        save_promotion_db(dbp)
 
-    debug_payload = {
-        "speaker_ht_density": speaker_ht_density,
-        "speaker_mode": speaker_mode,
-        "a3_events_total": len(a3_events),
-        "a3_reversals_total": len(reversed_events),
-        "pipeline_metrics": metrics.snapshot(),
-    }
+    _progress(100, "Done")
 
     return {
-    "text": final_text,
-    "segments": segments_list
-}
-
+        "text": final_text,
+        "segments": segments_list,
+        "debug": {
+            "speaker_ht_density": speaker_ht_density,
+            "speaker_mode": speaker_mode,
+            "a3_events_total": len(a3_events),
+            "a3_reversals_total": len(reversed_events),
+            "pipeline_metrics": metrics.snapshot(),
+        } if debug else None,
+    }

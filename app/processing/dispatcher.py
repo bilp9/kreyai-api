@@ -1,57 +1,68 @@
 # app/processing/dispatcher.py
 
+from google.cloud import run_v2
+import google.auth
 import os
-from google.auth.transport.requests import AuthorizedSession
-from google.auth import default as google_auth_default
 
-from app.state.firestore_jobs import update_job
-from app.constants import JobStatus
-from app.events.recorder import record_event
 
-PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
-REGION = os.environ.get("GCP_REGION", "us-central1")
-WORKER_JOB_NAME = os.environ.get("WORKER_JOB_NAME", "kreyai-worker")
+def _get_project_id() -> str:
+    """
+    Robust project resolution for Cloud Run production.
+    Priority:
+      1. GOOGLE_CLOUD_PROJECT
+      2. GCP_PROJECT
+      3. Auto-detect via ADC (google.auth.default)
+    """
+
+    project = (
+        os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or os.environ.get("GCP_PROJECT")
+    )
+
+    if project:
+        return project
+
+    # Fallback to Application Default Credentials metadata
+    credentials, detected_project = google.auth.default()
+
+    if detected_project:
+        return detected_project
+
+    raise RuntimeError("Unable to determine GCP project ID.")
 
 
 def dispatch_job(job_id: str):
     """
-    1) Mark job as queued in Firestore
-    2) Automatically trigger Cloud Run Job execution
+    Production-grade Cloud Run Job trigger.
+    Executes kreyai-worker and passes JOB_ID as env var.
     """
 
-    # Update Firestore
-    update_job(job_id, {
-        "status": JobStatus.QUEUED,
-        "progress": 0,
-    })
+    project = _get_project_id()
+    region = os.environ.get("CLOUD_RUN_REGION", "us-central1")
 
-    record_event(
-        job_id,
-        "queued",
-        "Job queued (auto-trigger)",
-        JobStatus.QUEUED,
+    client = run_v2.JobsClient()
+
+    job_name = f"projects/{project}/locations/{region}/jobs/kreyai-worker"
+
+    request = run_v2.RunJobRequest(
+        name=job_name,
+        overrides=run_v2.RunJobRequest.Overrides(
+            container_overrides=[
+                run_v2.RunJobRequest.Overrides.ContainerOverride(
+                    # MUST match container name in Cloud Run Job
+                    name="kreyai-worker",
+                    env=[
+                        run_v2.EnvVar(
+                            name="JOB_ID",
+                            value=job_id,
+                        )
+                    ],
+                )
+            ]
+        ),
     )
 
-    # Authenticate inside Cloud Run
-    credentials, _ = google_auth_default(
-        scopes=["https://www.googleapis.com/auth/cloud-platform"]
-    )
-    authed_session = AuthorizedSession(credentials)
+    operation = client.run_job(request=request)
 
-    url = (
-        f"https://run.googleapis.com/v2/projects/{PROJECT_ID}"
-        f"/locations/{REGION}/jobs/{WORKER_JOB_NAME}:run"
-    )
-
-    response = authed_session.post(url, json={}, timeout=30)
-
-    if response.status_code >= 300:
-        record_event(
-            job_id,
-            "dispatch_error",
-            f"Worker start failed: {response.text}",
-            JobStatus.QUEUED,
-        )
-        raise RuntimeError(
-            f"Failed to start worker job: {response.status_code} {response.text}"
-        )
+    print(f"🚀 Triggered worker for job {job_id}")
+    return operation
