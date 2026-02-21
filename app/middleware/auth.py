@@ -7,22 +7,34 @@ from app.models.user import get_user_by_api_key
 class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
 
-        # ✅ Allow CORS preflight requests
+        # ✅ Allow CORS preflight
         if request.method == "OPTIONS":
             return await call_next(request)
 
         path = request.url.path
 
-        # ✅ Public endpoints (no API key required)
+        # ----------------------------------------
+        # ✅ PUBLIC ROUTES (NO API KEY REQUIRED)
+        # ----------------------------------------
+
         if (
-            path in ("/docs", "/openapi.yaml", "/health")
-            or path.startswith("/api/jobs/")     # job access + downloads
-            or path == "/api/"                   # create job
-            or path == "/api/verify"             # verify job
+            # Health + Docs
+            path.startswith("/health")
+            or path.startswith("/docs")
+            or path.startswith("/openapi")
+
+            # Public job flow
+            or path.startswith("/api/jobs")      # upload, status, download
+            or path.startswith("/api/verify")    # verify job
+            or path == "/api"
+            or path == "/api/"
         ):
             return await call_next(request)
 
-        # 🔐 Everything else requires API key
+        # ----------------------------------------
+        # 🔐 EVERYTHING ELSE REQUIRES API KEY
+        # ----------------------------------------
+
         api_key = request.headers.get("X-API-Key")
 
         if not api_key:
@@ -32,11 +44,14 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
             )
 
         user = get_user_by_api_key(api_key)
+
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid API key",
             )
 
+        # Attach user to request state for downstream usage
         request.state.user = user
+
         return await call_next(request)
