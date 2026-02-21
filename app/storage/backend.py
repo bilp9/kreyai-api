@@ -1,4 +1,5 @@
 # app/storage/backend.py
+
 import os
 import datetime
 import google.auth
@@ -39,6 +40,16 @@ class GCSStorage:
         blob = self.bucket.blob(blob_path)
         blob.upload_from_file(file_obj)
         return blob_path
+
+    # -----------------------------
+    # Backward compatibility wrapper
+    # -----------------------------
+
+    def save_upload(self, job_id: str, filename: str, file_obj):
+        """
+        Compatibility wrapper for existing upload route.
+        """
+        return self.upload_file(job_id, file_obj, filename)
 
     # -----------------------------
     # DOWNLOAD (Worker)
@@ -91,6 +102,10 @@ class GCSStorage:
 
         return url
 
+
+# -------------------------------------------------
+# Singleton instance
+# -------------------------------------------------
 
 _storage_instance = None
 
