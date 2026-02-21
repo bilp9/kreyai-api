@@ -1,4 +1,3 @@
-# app/middleware/auth.py
 from fastapi import Request, HTTPException, status
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -7,10 +6,23 @@ from app.models.user import get_user_by_api_key
 
 class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Public endpoints
-        if request.url.path in ("/docs", "/openapi.yaml", "/health"):
+
+        # ✅ Allow CORS preflight requests
+        if request.method == "OPTIONS":
             return await call_next(request)
 
+        path = request.url.path
+
+        # ✅ Public endpoints (no API key required)
+        if (
+            path in ("/docs", "/openapi.yaml", "/health")
+            or path.startswith("/api/jobs/")     # job access + downloads
+            or path == "/api/"                   # create job
+            or path == "/api/verify"             # verify job
+        ):
+            return await call_next(request)
+
+        # 🔐 Everything else requires API key
         api_key = request.headers.get("X-API-Key")
 
         if not api_key:

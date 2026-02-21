@@ -25,13 +25,32 @@ app = FastAPI(
     title="KreyAI Transcription API",
     version="1.0.0",
 )
+# -------------------------------------------------
+# CORS (Frontend access)
+# -------------------------------------------------
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://www.kreyai.com",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -------------------------------------------------
-# Health check (REQUIRED for Cloud Run)
+# Health check (Cloud Run required)
 # -------------------------------------------------
 @app.get("/health", include_in_schema=False)
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "service": "kreyai-api",
+        "version": "1.0.0",
+    }
 
 # -------------------------------------------------
 # Middleware
@@ -41,6 +60,7 @@ from app.middleware.rate_limit import (
     RateLimitHeadersMiddleware,
 )
 from app.middleware.auth import APIKeyAuthMiddleware
+from app.middleware.job_access import JobAccessMiddleware
 
 # Headers-only middleware (safe)
 app.add_middleware(RateLimitHeadersMiddleware)
@@ -53,6 +73,9 @@ app.add_middleware(
 
 # API key auth
 app.add_middleware(APIKeyAuthMiddleware)
+
+# Job-level access control (AFTER auth)
+app.add_middleware(JobAccessMiddleware)
 
 # -------------------------------------------------
 # Routes
@@ -77,17 +100,8 @@ def openapi_yaml():
     )
 
 # -------------------------------------------------
-# Background maintenance
+# Background maintenance (disabled on Cloud Run)
 # -------------------------------------------------
-@app.get("/health", include_in_schema=False)
-def health():
-    return {
-        "status": "ok",
-        "service": "kreyai-api",
-        "version": "1.0.0",
-    }
-
-
 @app.on_event("startup")
 def start_reaper():
     """
@@ -113,4 +127,3 @@ def start_reaper():
             time.sleep(10)
 
     threading.Thread(target=loop, daemon=True).start()
-
