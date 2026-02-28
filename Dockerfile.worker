@@ -1,3 +1,4 @@
+# /Users/billyp/projects/kreyai-api/Dockerfile.worker
 FROM python:3.12-slim
 
 WORKDIR /app

@@ -1,3 +1,5 @@
+# app/transcription/engine.py
+
 # =================================================
 # KreyAI Transcription Engine — API v1 (FROZEN)
 # Any breaking change requires v2
@@ -7,7 +9,7 @@ from __future__ import annotations
 
 import os
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, List, Dict, Any
 from collections import deque
 from pathlib import Path
@@ -20,7 +22,7 @@ from faster_whisper import WhisperModel
 from app.transcription.akademi_normalize import AkademiNormalizer
 
 # -------------------------------------------------
-# Linguistic pipeline
+# Linguistic pipeline (HT-only)
 # -------------------------------------------------
 from app.transcription.normalize import normalize_creole
 from app.transcription.contractions import expand_contractions
@@ -32,21 +34,21 @@ from app.transcription.lexical_correction import apply_lexical_corrections
 from app.transcription.technical import resolve_tech_phrases
 from app.transcription.formatting import apply_formatting
 
-# Confidence / hallucination
+# Confidence / hallucination (HT-only gates; harmless to compute but we keep HT-only)
 from app.transcription.metrics import is_hallucinated
 from app.transcription.confidence import split_segments_by_confidence, is_low_confidence
 
 # Observability
 from app.transcription.observability import PipelineMetrics
 
-# HT density
+# HT density (HT-only)
 from app.transcription.ht_density import (
     compute_ht_density,
     compute_ht_density_window,
     should_fire_a3,
 )
 
-# Promotion + reversal
+# Promotion + reversal (HT-only)
 from app.transcription.promotion import (
     load_promotion_db,
     save_promotion_db,
@@ -92,7 +94,7 @@ Rules:
 
 
 # -------------------------------------------------
-# Gate thresholds (TUNED)
+# Gate thresholds (TUNED) — HT-only
 # -------------------------------------------------
 SPEAKER_NO_A3 = 0.18
 SPEAKER_RESTRICTED_A3 = 0.30
@@ -109,7 +111,10 @@ class TranscriptionConfig:
     model_size: str = "small"
     device: str = "cpu"
     compute_type: str = "int8"
-    language: str = "ht"
+
+    # Default to English for multi-language product;
+    # HT pipeline activates only when language == "ht".
+    language: str = "en"
 
     beam_size: int = 5
     temperature: float = 0.0
@@ -136,7 +141,6 @@ def _get_model(cfg: TranscriptionConfig) -> WhisperModel:
     global _MODEL
     if _MODEL is None:
         model_path = os.getenv("WHISPER_MODEL_PATH", cfg.model_size)
-
         _MODEL = WhisperModel(
             model_path,
             device=cfg.device,
@@ -170,24 +174,43 @@ def transcribe_audio(
     cfg: Optional[TranscriptionConfig] = None,
     progress_cb=None,
     *,
+    language: Optional[str] = None,
     debug: bool = False,
 ) -> Dict[str, Any]:
+    """
+    Returns:
+      {
+        "text": str,
+        "segments": [{"start": float, "end": float, "text": str}],
+        "debug": {...} | None
+      }
 
-    cfg = cfg or TranscriptionConfig(initial_prompt=HT_DECODING_PROMPT)
+    progress_cb:
+      callable(pct:int, msg:str) -> None
+    """
+
+    cfg = cfg or TranscriptionConfig()
+
+    # Optional per-call language override (from job record)
+    if language:
+        cfg = replace(cfg, language=str(language).lower())
 
     def _progress(pct: int, msg: str):
         if callable(progress_cb):
             try:
                 progress_cb(int(pct), str(msg))
             except Exception:
-                pass
+                pass  # never let progress reporting crash transcription
 
     _progress(10, "Loading model")
     model = _get_model(cfg)
-    akademi = _load_akademi()
+
+    # Only load Akademi lexicon for Haitian Creole runs
+    akademi = _load_akademi() if cfg.language == "ht" else None
     metrics = PipelineMetrics()
 
     _progress(20, "Transcribing audio")
+
     segments_iter, _info = model.transcribe(
         audio_path,
         language=cfg.language,
@@ -195,7 +218,7 @@ def transcribe_audio(
         temperature=cfg.temperature,
         vad_filter=cfg.vad_filter,
         condition_on_previous_text=cfg.condition_on_previous_text,
-        initial_prompt=cfg.initial_prompt or HT_DECODING_PROMPT,
+        initial_prompt=HT_DECODING_PROMPT if cfg.language == "ht" else None,
         no_speech_threshold=cfg.no_speech_threshold,
         log_prob_threshold=cfg.log_prob_threshold,
         compression_ratio_threshold=cfg.compression_ratio_threshold,
@@ -233,17 +256,33 @@ def transcribe_audio(
 
     if not raw_segments:
         _progress(100, "No speech detected")
-        return {"text": "", "segments": []}
+        return {"text": "", "segments": [], "debug": None}
+
+    # =================================================
+    # NON-HT: minimal post-processing
+    # =================================================
+    if cfg.language != "ht":
+        _progress(75, "Basic formatting")
+        joined = " ".join(seg["text"] for seg in raw_segments)
+        final_text = apply_formatting(joined).strip()
+
+        for i in range(min(len(segments_list), len(raw_segments))):
+            segments_list[i]["text"] = raw_segments[i]["text"]
+
+        _progress(100, "Done")
+        return {"text": final_text, "segments": segments_list, "debug": None}
+
+    # =================================================
+    # HT: Full KreyAI enhancement pipeline
+    # =================================================
 
     _progress(35, "Post-processing (confidence gates)")
     split_segments_by_confidence(raw_segments)
-
     for seg in raw_segments:
         seg["low_confidence"] = is_low_confidence(seg)
 
     _progress(45, "Computing HT density")
-
-    speaker_hits = []
+    speaker_hits: List[float] = []
     for seg in raw_segments:
         d = compute_ht_density(seg["raw_text"])
         seg["ht_density_raw"] = d["ht_density"]
@@ -253,23 +292,27 @@ def transcribe_audio(
     speaker_mode = _speaker_gate(speaker_ht_density)
 
     _progress(60, "Linguistic normalization (pass 1)")
-
     for seg in raw_segments:
         text = seg["text"]
         confidence = seg.get("avg_logprob")
 
-        if akademi and cfg.language == "ht":
+        # Akademi normalization (early)
+        if akademi:
             text = akademi.normalize_text(text)
 
         text, _ = expand_contractions(text)
         text, _ = normalize_dialect_variants(text)
+
+        # Pass 1: no A3
         text, _ = normalize_creole(text, a3_mode="none", metrics=None)
+
         text, _ = apply_lexical_bias(text)
         text, _ = normalize_verb_phrases(text)
         text, _ = normalize_pronoun_tma(text)
         text, _ = apply_contextual_corrections(text, confidence=confidence)
         text, _ = apply_lexical_corrections(text)
 
+        # Akademi normalization (late)
         ak = _load_akademi()
         if ak:
             text = ak.normalize_text(text)
@@ -277,7 +320,6 @@ def transcribe_audio(
         seg["text"] = text
 
     _progress(75, "A3 window corrections")
-
     window = deque(maxlen=cfg.a3_window_segments)
     a3_events: List[A3Event] = []
     promo_db = load_promotion_db()
@@ -321,16 +363,16 @@ def transcribe_audio(
     save_promotion_db(promo_db)
 
     _progress(88, "Formatting output")
-
     joined = " ".join(seg["text"] for seg in raw_segments)
     joined, _ = resolve_tech_phrases(joined, confidence=None)
     final_text = apply_formatting(joined).strip()
 
+    # Keep timestamps but replace per-segment text with cleaned version
     for i in range(min(len(segments_list), len(raw_segments))):
         segments_list[i]["text"] = raw_segments[i]["text"]
 
+    # A3 reversal detection
     reversed_events = detect_a3_reversals(a3_events=a3_events, final_text=final_text)
-
     if reversed_events:
         dbp = load_promotion_db()
         for ev in reversed_events:
@@ -342,11 +384,16 @@ def transcribe_audio(
     return {
         "text": final_text,
         "segments": segments_list,
-        "debug": {
-            "speaker_ht_density": speaker_ht_density,
-            "speaker_mode": speaker_mode,
-            "a3_events_total": len(a3_events),
-            "a3_reversals_total": len(reversed_events),
-            "pipeline_metrics": metrics.snapshot(),
-        } if debug else None,
+        "debug": (
+            {
+                "language": cfg.language,
+                "speaker_ht_density": speaker_ht_density,
+                "speaker_mode": speaker_mode,
+                "a3_events_total": len(a3_events),
+                "a3_reversals_total": len(reversed_events),
+                "pipeline_metrics": metrics.snapshot(),
+            }
+            if debug
+            else None
+        ),
     }

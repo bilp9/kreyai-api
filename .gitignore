@@ -14,7 +14,9 @@ __pycache__/
 # Local runtime
 queue.db
 
+# Ignore uploaded media files only
 app/storage/*.m4a
 app/storage/*.mp3
 app/storage/*.mp4
 app/storage/*.MOV
+app/storage/uploads/cors.json

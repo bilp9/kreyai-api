@@ -1,4 +1,3 @@
-# app/main.py
 # =====================================
 # PUBLIC API v1 — FROZEN
 # =====================================
@@ -9,6 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 # -------------------------------------------------
 # Runtime guard
@@ -25,21 +25,6 @@ app = FastAPI(
     title="KreyAI Transcription API",
     version="1.0.0",
 )
-# -------------------------------------------------
-# CORS (Frontend access)
-# -------------------------------------------------
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://www.kreyai.com",
-        "http://localhost:3000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # -------------------------------------------------
 # Health check (Cloud Run required)
@@ -53,7 +38,7 @@ def health():
     }
 
 # -------------------------------------------------
-# Middleware
+# Middleware (INNER)
 # -------------------------------------------------
 from app.middleware.rate_limit import (
     RateLimitMiddleware,
@@ -62,10 +47,10 @@ from app.middleware.rate_limit import (
 from app.middleware.auth import APIKeyAuthMiddleware
 from app.middleware.job_access import JobAccessMiddleware
 
-# Headers-only middleware (safe)
+# Headers-only middleware
 app.add_middleware(RateLimitHeadersMiddleware)
 
-# Rate limiting (API routes only)
+# Rate limiting
 app.add_middleware(
     RateLimitMiddleware,
     rpm=120,
@@ -74,8 +59,23 @@ app.add_middleware(
 # API key auth
 app.add_middleware(APIKeyAuthMiddleware)
 
-# Job-level access control (AFTER auth)
+# Job-level access control
 app.add_middleware(JobAccessMiddleware)
+
+# -------------------------------------------------
+# CORS (OUTERMOST — MUST BE LAST)
+# -------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://www.kreyai.com",
+        "https://kreyai.com",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -------------------------------------------------
 # Routes
@@ -93,6 +93,7 @@ def openapi_yaml():
     path = Path("docs/openapi.yaml")
     if not path.exists():
         raise RuntimeError("docs/openapi.yaml not found")
+
     return FileResponse(
         path,
         media_type="application/yaml",

@@ -113,7 +113,7 @@ async def send_completion_email(email: str, job_id: str):
       </ul>
 
       <p style="font-size:13px; color:#777;">
-        Note: These links expire in 1 hour.
+        Note: These links expire in 7 days.
       </p>
 
       <p>Thank you for using KreyAI.</p>

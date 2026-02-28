@@ -4,9 +4,20 @@ import asyncio
 import os
 import uuid
 from datetime import datetime
+from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Request
+# FastAPI
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    UploadFile,
+    File,
+    Request,
+    Body,
+)
+from fastapi.responses import RedirectResponse
 
+# Internal app modules
 from app.constants import JobStatus, JOB_ID_PREFIX
 from app.state.firestore_jobs import (
     create_job as fs_create_job,
@@ -17,12 +28,18 @@ from app.processing.dispatcher import dispatch_job
 from app.events.recorder import record_event, get_events
 from app.storage.backend import get_storage
 from app.services.email_service import send_verification_email
-
-from app.security.job_tokens import JobTokenConfig, mint_job_token
-
+from app.security.job_tokens import (
+    JobTokenConfig,
+    mint_job_token,
+    verify_job_token,
+    TokenExpired,
+    TokenInvalid,
+)
 
 router = APIRouter(prefix="/api", tags=["jobs"])
-
+# -------------------------------------------------
+# Token Helpers
+# -------------------------------------------------
 
 def _token_cfg() -> JobTokenConfig:
     secret = os.getenv("JOB_TOKEN_SECRET", "")
@@ -30,17 +47,45 @@ def _token_cfg() -> JobTokenConfig:
     return JobTokenConfig(secret=secret, ttl_seconds=ttl)
 
 
+def _require_token(request: Request, job_id: str) -> None:
+    token = request.query_params.get("t") or request.headers.get("X-Job-Token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing access token.")
+
+    try:
+        verify_job_token(_token_cfg(), token=token, job_id=job_id)
+    except TokenExpired:
+        raise HTTPException(status_code=410, detail="Access expired.")
+    except TokenInvalid:
+        raise HTTPException(status_code=401, detail="Invalid access token.")
+
+
 # -------------------------------------------------
 # 1️⃣ Create Job
 # -------------------------------------------------
+
+
 @router.post("/")
-async def create_job_route(email: str):
+async def create_job_route(
+    email: str = Body(...),
+    language: str = Body("en"),
+    accepted_terms: bool = Body(False),
+):
+    if not accepted_terms:
+        raise HTTPException(
+            status_code=400,
+            detail="You must accept the Terms of Service."
+        )
+
     job_id = f"{JOB_ID_PREFIX}-{uuid.uuid4().hex[:6].upper()}"
     code = str(uuid.uuid4().int)[-6:]
 
     job = {
         "job_id": job_id,
         "email": email,
+        "language": language,
+        "accepted_terms": True,
+        "terms_accepted_at": datetime.utcnow().isoformat(),
         "verification_code": code,
         "verified": False,
         "status": JobStatus.PENDING_VERIFICATION,
@@ -51,14 +96,7 @@ async def create_job_route(email: str):
     }
 
     fs_create_job(job)
-
-    record_event(
-        job_id,
-        "job_created",
-        "Awaiting verification",
-        JobStatus.PENDING_VERIFICATION,
-    )
-
+    record_event(job_id, "job_created", "Awaiting verification", JobStatus.PENDING_VERIFICATION)
     asyncio.create_task(send_verification_email(email, job_id, code))
 
     return {
@@ -67,10 +105,10 @@ async def create_job_route(email: str):
         "created_at": job["created_at"],
     }
 
-
 # -------------------------------------------------
 # 2️⃣ Verify Job
 # -------------------------------------------------
+
 @router.post("/verify")
 def verify_job_route(job_id: str, code: str):
     job = fs_get_job(job_id)
@@ -79,6 +117,10 @@ def verify_job_route(job_id: str, code: str):
 
     if code != job.get("verification_code"):
         raise HTTPException(400, "Invalid verification code")
+
+    if job.get("verified"):
+        token = mint_job_token(_token_cfg(), job_id=job_id)
+        return {"message": "Already verified", "access_token": token}
 
     fs_update_job(
         job_id,
@@ -90,53 +132,23 @@ def verify_job_route(job_id: str, code: str):
     )
 
     record_event(job_id, "verified", "Email verified", JobStatus.VERIFIED)
-    return {"message": "Verification successful"}
-
-
-# -------------------------------------------------
-# 2.5️⃣ Mint Access Link (token)
-# -------------------------------------------------
-from fastapi import Response
-# -------------------------------------------------
-# OPTIONS handler for CORS preflight
-# -------------------------------------------------
-
-
-@router.post("/jobs/{job_id}/access")
-def mint_access_route(job_id: str, request: Request):
-    """
-    Returns an access URL containing an expiring token.
-    Use this after job is verified (or after completion).
-    For quiet beta / request-access, you can require verification.
-    """
-    job = fs_get_job(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-
-    # Require verified to mint token (keeps random people out)
-    if not job.get("verified"):
-        raise HTTPException(400, "Job not verified")
 
     token = mint_job_token(_token_cfg(), job_id=job_id)
 
-    base = str(request.base_url).rstrip("/")
-    # This is the API download example; front-end can use /jobs/{job_id}?t=...
-    job_url = f"{base}/api/jobs/{job_id}?t={token}"
-
-    return {"job_id": job_id, "access_token": token, "job_url": job_url}
+    return {"message": "Verification successful", "access_token": token}
 
 
 # -------------------------------------------------
-# 3️⃣ Upload File
+# 3️⃣ Upload (Legacy)
 # -------------------------------------------------
+
 @router.post("/jobs/{job_id}/upload")
-def upload_file_route(job_id: str, file: UploadFile = File(...)):
+def upload_file_route(job_id: str, request: Request, file: UploadFile = File(...)):
+    _require_token(request, job_id)
+
     job = fs_get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-
-    if not job.get("verified"):
-        raise HTTPException(400, "Job not verified")
 
     storage = get_storage()
     upload_path = storage.save_upload(job_id, file.filename, file.file)
@@ -146,6 +158,7 @@ def upload_file_route(job_id: str, file: UploadFile = File(...)):
         {
             "filename": file.filename,
             "upload_path": upload_path,
+            "file_path": upload_path,
             "progress": 0,
             "status": JobStatus.QUEUED,
             "updated_at": datetime.utcnow().isoformat(),
@@ -153,17 +166,19 @@ def upload_file_route(job_id: str, file: UploadFile = File(...)):
     )
 
     record_event(job_id, "uploaded", f"File uploaded: {file.filename}", JobStatus.QUEUED)
-
     dispatch_job(job_id)
 
     return {"message": "File uploaded and job queued"}
 
 
 # -------------------------------------------------
-# 4️⃣ Get Status
+# 4️⃣ Get Status (Token Protected)
 # -------------------------------------------------
+
 @router.get("/jobs/{job_id}")
-def get_job_route(job_id: str):
+def get_job_route(job_id: str, request: Request):
+    _require_token(request, job_id)
+
     job = fs_get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
@@ -179,42 +194,47 @@ def get_job_route(job_id: str):
 
 
 # -------------------------------------------------
-# 5️⃣ Get Events
+# 5️⃣ Get Events (Token Protected)
 # -------------------------------------------------
+
 @router.get("/jobs/{job_id}/events")
-def get_job_events_route(job_id: str):
+def get_job_events_route(job_id: str, request: Request):
+    _require_token(request, job_id)
+
     job = fs_get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
+
     return get_events(job_id)
 
 
 # -------------------------------------------------
-# 6️⃣ Download Endpoints
+# 6️⃣ Download Endpoints (Redirect)
 # -------------------------------------------------
+
 @router.get("/jobs/{job_id}/vtt")
-def download_vtt_route(job_id: str):
-    storage = get_storage()
-    url = storage.get_download_url(job_id, "transcript.vtt")
-    return {"download_url": url}
+def download_vtt_route(job_id: str, request: Request):
+    _require_token(request, job_id)
+    url = get_storage().get_download_url(job_id, "transcript.vtt")
+    return RedirectResponse(url, status_code=302)
 
 
 @router.get("/jobs/{job_id}/srt")
-def download_srt_route(job_id: str):
-    storage = get_storage()
-    url = storage.get_download_url(job_id, "transcript.srt")
-    return {"download_url": url}
+def download_srt_route(job_id: str, request: Request):
+    _require_token(request, job_id)
+    url = get_storage().get_download_url(job_id, "transcript.srt")
+    return RedirectResponse(url, status_code=302)
 
 
 @router.get("/jobs/{job_id}/txt")
-def download_txt_route(job_id: str):
-    storage = get_storage()
-    url = storage.get_download_url(job_id, "transcript.txt")
-    return {"download_url": url}
+def download_txt_route(job_id: str, request: Request):
+    _require_token(request, job_id)
+    url = get_storage().get_download_url(job_id, "transcript.txt")
+    return RedirectResponse(url, status_code=302)
 
 
 @router.get("/jobs/{job_id}/docx")
-def download_docx_route(job_id: str):
-    storage = get_storage()
-    url = storage.get_download_url(job_id, "transcript.docx")
-    return {"download_url": url}
+def download_docx_route(job_id: str, request: Request):
+    _require_token(request, job_id)
+    url = get_storage().get_download_url(job_id, "transcript.docx")
+    return RedirectResponse(url, status_code=302)
