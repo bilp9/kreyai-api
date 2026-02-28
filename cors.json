@@ -1,0 +1,17 @@
+[
+    {
+      "origin": [
+        "https://kreyai.com",
+        "https://www.kreyai.com",
+        "http://localhost:3000"
+      ],
+      "method": ["GET", "PUT", "POST"],
+      "responseHeader": [
+        "Content-Type",
+        "x-goog-resumable",
+        "Content-Range",
+        "Content-Length"
+      ],
+      "maxAgeSeconds": 3600
+    }
+  ]

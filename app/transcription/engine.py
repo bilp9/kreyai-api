@@ -108,7 +108,7 @@ WINDOW_FULL_A3 = 0.35
 # -------------------------------------------------
 @dataclass(frozen=True)
 class TranscriptionConfig:
-    model_size: str = "small"
+    model_size: str = "medium"
     device: str = "cpu"
     compute_type: str = "int8"
 
