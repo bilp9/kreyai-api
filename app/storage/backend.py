@@ -2,6 +2,8 @@
 
 import os
 import datetime
+import google.auth
+from google.auth.transport.requests import Request
 from google.cloud import storage
 
 
@@ -19,9 +21,12 @@ class GCSStorage:
         self.client = storage.Client()
         self.bucket = self.client.bucket(self.bucket_name)
 
-    # -----------------------------
+        # Load default credentials (Cloud Run metadata server)
+        self.credentials, self.project = google.auth.default()
+
+    # -------------------------------------------------
     # PATH HELPERS
-    # -----------------------------
+    # -------------------------------------------------
 
     def upload_blob_path(self, job_id: str, filename: str) -> str:
         return f"jobs/{job_id}/uploads/{filename}"
@@ -29,16 +34,34 @@ class GCSStorage:
     def output_blob_path(self, job_id: str, filename: str) -> str:
         return f"jobs/{job_id}/outputs/{filename}"
 
-    # -----------------------------
-    # RESUMABLE START URL
-    # -----------------------------
+    # -------------------------------------------------
+    # RESUMABLE START URL (15 min)
+    # -------------------------------------------------
 
     def generate_resumable_start_url(
         self,
         blob_path: str,
         content_type: str,
     ) -> str:
+        """
+        Creates signed URL to START a resumable upload session.
+        Frontend must send:
+            x-goog-resumable: start
+        """
+
         blob = self.bucket.blob(blob_path)
+
+        # Refresh credentials to ensure valid access token
+        self.credentials.refresh(Request())
+
+        service_account_email = getattr(
+            self.credentials,
+            "service_account_email",
+            None,
+        )
+
+        if not service_account_email:
+            raise RuntimeError("Service account email not available")
 
         url = blob.generate_signed_url(
             version="v4",
@@ -48,38 +71,92 @@ class GCSStorage:
                 "x-goog-resumable": "start",
                 "content-type": content_type,
             },
+            service_account_email=service_account_email,
+            access_token=self.credentials.token,
         )
 
         return url
 
-    # -----------------------------
-    # SIGNED DOWNLOAD URL (7 days)
-    # -----------------------------
+    # -------------------------------------------------
+    # UPLOAD (Legacy small files)
+    # -------------------------------------------------
 
-    def get_download_url(
+    def upload_file(self, job_id: str, file_obj, filename: str):
+        blob_path = self.upload_blob_path(job_id, filename)
+        blob = self.bucket.blob(blob_path)
+        blob.upload_from_file(file_obj)
+        return blob_path
+
+    # -------------------------------------------------
+    # WORKER DOWNLOAD
+    # -------------------------------------------------
+
+    def download_to_file(self, source: str, local_path: str):
+        blob = self.bucket.blob(source)
+
+        if not blob.exists():
+            raise RuntimeError(f"GCS input file not found: {source}")
+
+        blob.download_to_filename(local_path)
+        return local_path
+
+    # -------------------------------------------------
+    # SAVE OUTPUT
+    # -------------------------------------------------
+
+    def save_output(
         self,
         job_id: str,
         filename: str,
-        force_download: bool = False,
-    ) -> str:
+        data: bytes,
+        content_type: str,
+    ):
+        blob_path = self.output_blob_path(job_id, filename)
+        blob = self.bucket.blob(blob_path)
+        blob.upload_from_string(data, content_type=content_type)
+        return blob_path
+
+    # -------------------------------------------------
+    # SIGNED DOWNLOAD URL (7 days)
+    # -------------------------------------------------
+
+    def get_download_url(self, job_id: str, filename: str) -> str:
         blob_path = self.output_blob_path(job_id, filename)
         blob = self.bucket.blob(blob_path)
 
         if not blob.exists():
-            raise RuntimeError("File not found")
+            raise RuntimeError(f"GCS output file not found: {blob_path}")
 
-        response_disposition = None
-        if force_download:
-            response_disposition = f'attachment; filename="{filename}"'
+        self.credentials.refresh(Request())
+
+        service_account_email = getattr(
+            self.credentials,
+            "service_account_email",
+            None,
+        )
+
+        if not service_account_email:
+            raise RuntimeError("Service account email not available")
 
         url = blob.generate_signed_url(
             version="v4",
             expiration=datetime.timedelta(days=7),
             method="GET",
-            response_disposition=response_disposition,
+            service_account_email=service_account_email,
+            access_token=self.credentials.token,
         )
 
         return url
+
+    # -------------------------------------------------
+    # Backward compatibility wrapper
+    # -------------------------------------------------
+
+    def save_upload(self, job_id: str, filename: str, file_obj):
+        """
+        Compatibility wrapper for existing upload route.
+        """
+        return self.upload_file(job_id, file_obj, filename)
 
 
 # -------------------------------------------------
