@@ -7,7 +7,9 @@ from app.models.user import get_user_by_api_key
 class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
 
+        # ----------------------------------------
         # ✅ Allow CORS preflight
+        # ----------------------------------------
         if request.method == "OPTIONS":
             return await call_next(request)
 
@@ -16,25 +18,18 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
         # ----------------------------------------
         # ✅ PUBLIC ROUTES (NO API KEY REQUIRED)
         # ----------------------------------------
-
         if (
-            # Health + Docs
-            path.startswith("/health")
+            path == "/"                              # Allow base URL
+            or path.startswith("/health")
             or path.startswith("/docs")
             or path.startswith("/openapi")
-
-            # Public job flow
-            or path.startswith("/api/jobs")      # upload, status, download
-            or path.startswith("/api/verify")    # verify job
-            or path == "/api"
-            or path == "/api/"
+            or path.startswith("/api")               # Allow ALL public SaaS API
         ):
             return await call_next(request)
 
         # ----------------------------------------
         # 🔐 EVERYTHING ELSE REQUIRES API KEY
         # ----------------------------------------
-
         api_key = request.headers.get("X-API-Key")
 
         if not api_key:
@@ -51,7 +46,7 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
                 detail="Invalid API key",
             )
 
-        # Attach user to request state for downstream usage
+        # Attach user to request state
         request.state.user = user
 
         return await call_next(request)

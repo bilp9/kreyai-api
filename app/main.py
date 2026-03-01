@@ -26,6 +26,24 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# =================================================
+# ✅ CORS — MUST BE ADDED FIRST
+# =================================================
+# This ensures ALL responses (including 401/429/etc.)
+# include proper CORS headers for the browser.
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://www.kreyai.com",
+        "https://kreyai.com",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # -------------------------------------------------
 # Health check (Cloud Run required)
 # -------------------------------------------------
@@ -38,7 +56,7 @@ def health():
     }
 
 # -------------------------------------------------
-# Middleware (INNER)
+# Custom Middleware
 # -------------------------------------------------
 from app.middleware.rate_limit import (
     RateLimitMiddleware,
@@ -61,21 +79,6 @@ app.add_middleware(APIKeyAuthMiddleware)
 
 # Job-level access control
 app.add_middleware(JobAccessMiddleware)
-
-# -------------------------------------------------
-# CORS (OUTERMOST — MUST BE LAST)
-# -------------------------------------------------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://www.kreyai.com",
-        "https://kreyai.com",
-        "http://localhost:3000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # -------------------------------------------------
 # Routes
