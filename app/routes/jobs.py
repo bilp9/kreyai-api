@@ -1,3 +1,5 @@
+# app/routes/jobs.py
+
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +10,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, Body
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 
 from app.constants import JobStatus, JOB_ID_PREFIX
 from app.state.firestore_jobs import (
@@ -66,7 +69,7 @@ async def create_job_route(
     if not accepted_terms:
         raise HTTPException(
             status_code=400,
-            detail="You must accept the Terms of Service."
+            detail="You must accept the Terms of Service.",
         )
 
     job_id = f"{JOB_ID_PREFIX}-{uuid.uuid4().hex[:6].upper()}"
@@ -159,16 +162,20 @@ def create_upload_url(job_id: str, request: Request):
 
 
 # -------------------------------------------------
-# 4️⃣ Finalize Upload (Queue Job)
+# 4️⃣ Finalize Upload (FIXED — Uses JSON Body)
 # -------------------------------------------------
+
+class FinalizeUploadRequest(BaseModel):
+    file_path: str
+    size_bytes: int
+    content_type: str
+
 
 @router.post("/jobs/{job_id}/finalize-upload")
 def finalize_upload(
     job_id: str,
+    payload: FinalizeUploadRequest,
     request: Request,
-    file_path: str,
-    size_bytes: int,
-    content_type: str,
 ):
     _require_token(request, job_id)
 
@@ -179,9 +186,9 @@ def finalize_upload(
     fs_update_job(
         job_id,
         {
-            "file_path": file_path,
-            "size_bytes": size_bytes,
-            "content_type": content_type,
+            "file_path": payload.file_path,
+            "size_bytes": payload.size_bytes,
+            "content_type": payload.content_type,
             "status": JobStatus.QUEUED,
             "updated_at": datetime.utcnow().isoformat(),
         },
