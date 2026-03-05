@@ -214,7 +214,7 @@ def transcribe_audio(
     segments_iter, _info = model.transcribe(
         audio_path,
         language=cfg.language,
-        task="transcribe" #enforcing transcription over translation 
+        task="transcribe", #enforcing transcription over translation 
         beam_size=cfg.beam_size,
         temperature=cfg.temperature,
         vad_filter=cfg.vad_filter,
