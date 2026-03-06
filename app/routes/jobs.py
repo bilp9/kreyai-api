@@ -63,7 +63,7 @@ def _require_token(request: Request, job_id: str) -> None:
 @router.post("/")
 async def create_job_route(
     email: str = Body(...),
-    language: str = Body("en"),
+    language: str = Body("auto"),
     accepted_terms: bool = Body(False),
 ):
     if not accepted_terms:

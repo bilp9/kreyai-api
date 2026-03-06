@@ -248,7 +248,7 @@ async def run_job(job_id: str) -> None:
 
         # Run transcription
         result = await asyncio.wait_for(
-            asyncio.to_thread(transcribe_audio, local_path, progress_cb=progress_cb, language=job.get("language", "en"),
+            asyncio.to_thread(transcribe_audio, local_path, progress_cb=progress_cb, language=job.get("language"),
             ),
             timeout=PROCESS_ATTEMPT_TIMEOUT_SECONDS,
         )
