@@ -82,7 +82,6 @@ async def send_verification_email(to_email: str, job_id: str, code: str):
         html_content,
     )
 
-
 # -------------------------------------------------
 # Completion Email
 # -------------------------------------------------
@@ -96,6 +95,7 @@ async def send_completion_email(email: str, job_id: str):
     docx = storage.get_download_url(job_id, "transcript.docx")
     srt = storage.get_download_url(job_id, "transcript.srt")
     vtt = storage.get_download_url(job_id, "transcript.vtt")
+    html = storage.get_download_url(job_id, "transcript.html")
 
     html_content = f"""
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.6; color:#111;">
@@ -110,6 +110,7 @@ async def send_completion_email(email: str, job_id: str):
         <li><a href="{docx}">Download DOCX</a></li>
         <li><a href="{srt}">Download SRT</a></li>
         <li><a href="{vtt}">Download VTT</a></li>
+        <li><a href="{html}">Download HTML (Podcast / Website)</a></li>
       </ul>
 
       <p style="font-size:13px; color:#777;">
