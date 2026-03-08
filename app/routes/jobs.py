@@ -252,3 +252,9 @@ def download_vtt_route(job_id: str, request: Request):
     _require_token(request, job_id)
     url = get_storage().get_download_url(job_id, "transcript.vtt")
     return RedirectResponse(url, status_code=302)
+
+@router.get("/jobs/{job_id}/html")
+def download_html_route(job_id: str, request: Request):
+    _require_token(request, job_id)
+    url = get_storage().get_download_url(job_id, "transcript.html")
+    return RedirectResponse(url, status_code=302)
