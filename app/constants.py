@@ -36,7 +36,8 @@ class JobStatus(str, Enum):
 # =========================
 
 # Maximum upload size (target: 1–2 GB)
-MAX_UPLOAD_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+MAX_UPLOAD_SIZE_MB = 250
+MAX_AUDIO_DURATION_SECONDS = 7200   # 2 hours
 
 # Allowed file extensions (audio + video)
 ALLOWED_EXTENSIONS = {

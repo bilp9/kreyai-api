@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import asyncio
 import os
 from datetime import datetime
@@ -14,7 +15,9 @@ from app.constants import (
     JobStatus,
     PROCESS_ATTEMPT_TIMEOUT_SECONDS,
     PROCESS_MAX_ATTEMPTS,
+    MAX_AUDIO_DURATION_SECONDS,
 )
+
 from app.transcription.engine import transcribe_audio
 from app.storage.backend import get_storage
 from app.events.recorder import record_event
@@ -131,6 +134,28 @@ def _segments_from_result(result: Dict[str, Any]) -> List[Dict[str, Any]]:
         return [s for s in segs if isinstance(s, dict)]
 
     return []
+
+
+def get_audio_duration_seconds(file_path: str) -> float:
+
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        file_path,
+    ]
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+    )
+
+    return float(result.stdout.strip())
 
 
 # ---------------------------------------------------------
@@ -333,6 +358,15 @@ async def run_job(job_id: str):
             raise RuntimeError("Job missing storage path")
 
         storage.download_to_file(source_blob, local_path)
+
+        duration = get_audio_duration_seconds(local_path)
+
+        print(f"Audio duration: {duration} seconds")
+
+        if duration > MAX_AUDIO_DURATION_SECONDS:
+            raise RuntimeError(
+                f"Audio exceeds maximum allowed duration ({MAX_AUDIO_DURATION_SECONDS} seconds)"
+            )
 
         result = await asyncio.wait_for(
             asyncio.to_thread(
