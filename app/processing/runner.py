@@ -4,6 +4,7 @@ import subprocess
 import asyncio
 import os
 from datetime import datetime
+import time
 from io import BytesIO
 from typing import Optional, Dict, Any, List
 
@@ -136,6 +137,9 @@ def _segments_from_result(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+# ---------------------------------------------------------
+# Audio Helpers
+# ---------------------------------------------------------
 def get_audio_duration_seconds(file_path: str) -> float:
 
     cmd = [
@@ -155,7 +159,61 @@ def get_audio_duration_seconds(file_path: str) -> float:
         text=True,
     )
 
-    return float(result.stdout.strip())
+    output = (result.stdout or "").strip()
+
+    if not output:
+        raise RuntimeError("Unable to determine audio duration via ffprobe")
+
+    return float(output)
+
+
+def split_audio_into_chunks(file_path: str, chunk_seconds: int = 300) -> List[str]:
+    """
+    Production helper for future use.
+    NOT currently used in the pipeline.
+
+    Splits audio into chunked WAV files.
+    """
+
+    chunk_dir = f"{file_path}_chunks"
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    output_pattern = os.path.join(chunk_dir, "chunk_%03d.wav")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        file_path,
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_seconds),
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        output_pattern,
+    ]
+
+    subprocess.run(cmd, check=True, capture_output=True)
+
+    chunk_paths = sorted(
+        os.path.join(chunk_dir, name)
+        for name in os.listdir(chunk_dir)
+        if name.startswith("chunk_") and name.endswith(".wav")
+    )
+
+    return chunk_paths
+
+
+def estimate_cost_usd(audio_duration_seconds: float) -> float:
+    """
+    Conservative placeholder estimate.
+    Refine later using real observed GCP costs.
+    """
+    estimated = audio_duration_seconds * 0.0008
+    return round(estimated, 4)
 
 
 # ---------------------------------------------------------
@@ -255,10 +313,10 @@ def _build_podcast_html(job_id: str, segments: List[Dict[str, Any]]) -> str:
         "<h1>Podcast Transcript</h1>",
     ]
 
-    for spk, time, text in blocks:
+    for spk, time_value, text in blocks:
 
         html.append(
-            f"<p><strong>Speaker {spk} ({_format_hhmmss(time)})</strong></p>"
+            f"<p><strong>Speaker {spk} ({_format_hhmmss(time_value)})</strong></p>"
         )
 
         html.append(f"<p>{text.strip()}</p>")
@@ -279,7 +337,7 @@ def save_outputs(storage, job_id: str, result: Dict[str, Any]):
         job_id,
         "transcript.txt",
         (text + "\n").encode("utf-8"),
-        "text/plain",
+        "text/plain; charset=utf-8",
     )
 
     doc = Document()
@@ -305,9 +363,24 @@ def save_outputs(storage, job_id: str, result: Dict[str, Any]):
         vtt = _segments_to_vtt(segments)
         html = _build_podcast_html(job_id, segments)
 
-        storage.save_output(job_id, "transcript.srt", srt.encode("utf-8"), "application/x-subrip")
-        storage.save_output(job_id, "transcript.vtt", vtt.encode("utf-8"), "text/vtt")
-        storage.save_output(job_id, "transcript.html", html.encode("utf-8"), "text/html")
+        storage.save_output(
+            job_id,
+            "transcript.srt",
+            srt.encode("utf-8"),
+            "application/x-subrip",
+        )
+        storage.save_output(
+            job_id,
+            "transcript.vtt",
+            vtt.encode("utf-8"),
+            "text/vtt; charset=utf-8",
+        )
+        storage.save_output(
+            job_id,
+            "transcript.html",
+            html.encode("utf-8"),
+            "text/html; charset=utf-8",
+        )
 
 
 # ---------------------------------------------------------
@@ -350,6 +423,16 @@ async def run_job(job_id: str):
 
     try:
 
+        # ---------------------------------------------------------
+        # Metrics start
+        # ---------------------------------------------------------
+        start_time = time.time()
+        file_size_bytes = None
+        audio_duration_seconds = None
+        processing_time_seconds = None
+        estimated_cost_usd = None
+        # ---------------------------------------------------------
+
         storage = get_storage()
 
         source_blob = job.get("file_path") or job.get("upload_path")
@@ -359,7 +442,17 @@ async def run_job(job_id: str):
 
         storage.download_to_file(source_blob, local_path)
 
+        # ---------------------------------------------------------
+        # Metrics: downloaded file size
+        # ---------------------------------------------------------
+        if os.path.exists(local_path):
+            file_size_bytes = os.path.getsize(local_path)
+
+        # ---------------------------------------------------------
+        # Duration check
+        # ---------------------------------------------------------
         duration = get_audio_duration_seconds(local_path)
+        audio_duration_seconds = duration
 
         print(f"Audio duration: {duration} seconds")
 
@@ -379,6 +472,12 @@ async def run_job(job_id: str):
 
         save_outputs(storage, job_id, result)
 
+        # ---------------------------------------------------------
+        # Metrics end
+        # ---------------------------------------------------------
+        processing_time_seconds = round(time.time() - start_time, 3)
+        estimated_cost_usd = estimate_cost_usd(audio_duration_seconds or 0.0)
+
         doc_ref.update(
             {
                 "status": JobStatus.COMPLETED.value,
@@ -386,6 +485,12 @@ async def run_job(job_id: str):
                 "status_message": "Completed",
                 "completed_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat(),
+                "file_size_bytes": file_size_bytes,
+                "audio_duration_seconds": audio_duration_seconds,
+                "processing_time_seconds": processing_time_seconds,
+                "estimated_cost_usd": estimated_cost_usd,
+                "model": "faster-whisper",
+                "language_final": job.get("language", "auto"),
             }
         )
 
@@ -398,13 +503,29 @@ async def run_job(job_id: str):
 
     except Exception as e:
 
-        doc_ref.update(
-            {
-                "status": JobStatus.FAILED.value,
-                "status_message": str(e),
-                "updated_at": datetime.utcnow().isoformat(),
-            }
-        )
+        failure_update = {
+            "status": JobStatus.FAILED.value,
+            "status_message": str(e),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+
+        # Best-effort metrics even on failure
+        try:
+            if os.path.exists(local_path) and file_size_bytes is None:
+                file_size_bytes = os.path.getsize(local_path)
+            if processing_time_seconds is None:
+                processing_time_seconds = round(time.time() - start_time, 3)
+
+            if file_size_bytes is not None:
+                failure_update["file_size_bytes"] = file_size_bytes
+            if audio_duration_seconds is not None:
+                failure_update["audio_duration_seconds"] = audio_duration_seconds
+            if processing_time_seconds is not None:
+                failure_update["processing_time_seconds"] = processing_time_seconds
+        except Exception:
+            pass
+
+        doc_ref.update(failure_update)
 
         record_event(job_id, "failed", str(e), JobStatus.FAILED.value)
 
