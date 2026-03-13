@@ -32,6 +32,12 @@ except Exception:
 db = firestore.Client()
 JOBS_COL = "jobs"
 
+# ---------------------------------------------------------
+# Chunking config
+# ---------------------------------------------------------
+CHUNK_IF_LONGER_THAN_SECONDS = 600  # 10 minutes
+CHUNK_SIZE_SECONDS = 300            # 5 minutes
+
 
 # ---------------------------------------------------------
 # Claim Job
@@ -167,14 +173,10 @@ def get_audio_duration_seconds(file_path: str) -> float:
     return float(output)
 
 
-def split_audio_into_chunks(file_path: str, chunk_seconds: int = 300) -> List[str]:
+def split_audio_into_chunks(file_path: str, chunk_seconds: int = CHUNK_SIZE_SECONDS) -> List[str]:
     """
-    Production helper for future use.
-    NOT currently used in the pipeline.
-
-    Splits audio into chunked WAV files.
+    Split audio into mono 16k wav chunks.
     """
-
     chunk_dir = f"{file_path}_chunks"
     os.makedirs(chunk_dir, exist_ok=True)
 
@@ -204,7 +206,32 @@ def split_audio_into_chunks(file_path: str, chunk_seconds: int = 300) -> List[st
         if name.startswith("chunk_") and name.endswith(".wav")
     )
 
+    if not chunk_paths:
+        raise RuntimeError("Audio chunking produced no output files")
+
     return chunk_paths
+
+
+def cleanup_chunk_files(chunk_paths: List[str]) -> None:
+    """
+    Remove chunk files and their containing chunk dir if possible.
+    """
+    if not chunk_paths:
+        return
+
+    for path in chunk_paths:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    chunk_dir = os.path.dirname(chunk_paths[0])
+    try:
+        if os.path.isdir(chunk_dir) and not os.listdir(chunk_dir):
+            os.rmdir(chunk_dir)
+    except Exception:
+        pass
 
 
 def estimate_cost_usd(audio_duration_seconds: float) -> float:
@@ -214,6 +241,79 @@ def estimate_cost_usd(audio_duration_seconds: float) -> float:
     """
     estimated = audio_duration_seconds * 0.0008
     return round(estimated, 4)
+
+
+def merge_chunk_results(chunk_results: List[Dict[str, Any]], chunk_durations: List[float]) -> Dict[str, Any]:
+    """
+    Merge chunk transcription results into one full result, offsetting timestamps.
+    """
+    merged_segments: List[Dict[str, Any]] = []
+    merged_text_parts: List[str] = []
+
+    offset = 0.0
+
+    for result, duration in zip(chunk_results, chunk_durations):
+        chunk_text = (result.get("text") or "").strip()
+        if chunk_text:
+            merged_text_parts.append(chunk_text)
+
+        for seg in _segments_from_result(result):
+            merged_segments.append(
+                {
+                    "start": float(seg.get("start", 0.0)) + offset,
+                    "end": float(seg.get("end", 0.0)) + offset,
+                    "text": (seg.get("text") or "").strip(),
+                }
+            )
+
+        offset += duration
+
+    return {
+        "text": " ".join(merged_text_parts).strip(),
+        "segments": merged_segments,
+    }
+
+
+async def transcribe_with_optional_chunking(file_path: str, language: str) -> Dict[str, Any]:
+    """
+    Transcribe directly for shorter audio.
+    Chunk first for longer audio.
+    """
+    total_duration = get_audio_duration_seconds(file_path)
+
+    if total_duration <= CHUNK_IF_LONGER_THAN_SECONDS:
+        return await asyncio.to_thread(
+            transcribe_audio,
+            file_path,
+            language=language,
+        )
+
+    print(
+        f"Audio exceeds {CHUNK_IF_LONGER_THAN_SECONDS}s; "
+        f"chunking into {CHUNK_SIZE_SECONDS}s segments"
+    )
+
+    chunk_paths = split_audio_into_chunks(file_path, CHUNK_SIZE_SECONDS)
+
+    try:
+        chunk_results: List[Dict[str, Any]] = []
+        chunk_durations: List[float] = []
+
+        for chunk_path in chunk_paths:
+            duration = get_audio_duration_seconds(chunk_path)
+            chunk_durations.append(duration)
+
+            result = await asyncio.to_thread(
+                transcribe_audio,
+                chunk_path,
+                language=language,
+            )
+            chunk_results.append(result)
+
+        return merge_chunk_results(chunk_results, chunk_durations)
+
+    finally:
+        cleanup_chunk_files(chunk_paths)
 
 
 # ---------------------------------------------------------
@@ -423,15 +523,12 @@ async def run_job(job_id: str):
 
     try:
 
-        # ---------------------------------------------------------
-        # Metrics start
-        # ---------------------------------------------------------
         start_time = time.time()
         file_size_bytes = None
         audio_duration_seconds = None
         processing_time_seconds = None
         estimated_cost_usd = None
-        # ---------------------------------------------------------
+        realtime_factor = None
 
         storage = get_storage()
 
@@ -442,15 +539,9 @@ async def run_job(job_id: str):
 
         storage.download_to_file(source_blob, local_path)
 
-        # ---------------------------------------------------------
-        # Metrics: downloaded file size
-        # ---------------------------------------------------------
         if os.path.exists(local_path):
             file_size_bytes = os.path.getsize(local_path)
 
-        # ---------------------------------------------------------
-        # Duration check
-        # ---------------------------------------------------------
         duration = get_audio_duration_seconds(local_path)
         audio_duration_seconds = duration
 
@@ -462,8 +553,7 @@ async def run_job(job_id: str):
             )
 
         result = await asyncio.wait_for(
-            asyncio.to_thread(
-                transcribe_audio,
+            transcribe_with_optional_chunking(
                 local_path,
                 language=job.get("language", "auto"),
             ),
@@ -472,11 +562,14 @@ async def run_job(job_id: str):
 
         save_outputs(storage, job_id, result)
 
-        # ---------------------------------------------------------
-        # Metrics end
-        # ---------------------------------------------------------
         processing_time_seconds = round(time.time() - start_time, 3)
         estimated_cost_usd = estimate_cost_usd(audio_duration_seconds or 0.0)
+
+        if audio_duration_seconds:
+            realtime_factor = round(
+                processing_time_seconds / audio_duration_seconds,
+                4,
+            )
 
         doc_ref.update(
             {
@@ -489,6 +582,7 @@ async def run_job(job_id: str):
                 "audio_duration_seconds": audio_duration_seconds,
                 "processing_time_seconds": processing_time_seconds,
                 "estimated_cost_usd": estimated_cost_usd,
+                "realtime_factor": realtime_factor,
                 "model": "faster-whisper",
                 "language_final": job.get("language", "auto"),
             }
@@ -509,12 +603,17 @@ async def run_job(job_id: str):
             "updated_at": datetime.utcnow().isoformat(),
         }
 
-        # Best-effort metrics even on failure
         try:
             if os.path.exists(local_path) and file_size_bytes is None:
                 file_size_bytes = os.path.getsize(local_path)
             if processing_time_seconds is None:
                 processing_time_seconds = round(time.time() - start_time, 3)
+
+            if audio_duration_seconds and processing_time_seconds:
+                realtime_factor = round(
+                    processing_time_seconds / audio_duration_seconds,
+                    4,
+                )
 
             if file_size_bytes is not None:
                 failure_update["file_size_bytes"] = file_size_bytes
@@ -522,6 +621,8 @@ async def run_job(job_id: str):
                 failure_update["audio_duration_seconds"] = audio_duration_seconds
             if processing_time_seconds is not None:
                 failure_update["processing_time_seconds"] = processing_time_seconds
+            if realtime_factor is not None:
+                failure_update["realtime_factor"] = realtime_factor
         except Exception:
             pass
 
