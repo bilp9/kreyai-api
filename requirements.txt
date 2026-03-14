@@ -11,3 +11,6 @@ python-docx
 google-cloud-firestore
 google-cloud-run
 huggingface_hub
+torch
+torchaudio
+pyannote.audio
