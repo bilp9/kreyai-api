@@ -174,10 +174,147 @@ def get_audio_duration_seconds(file_path: str) -> float:
     return float(output)
 
 
-# ---------------------------------------------------------
-# (All other functions unchanged)
-# ---------------------------------------------------------
+def split_audio_into_chunks(file_path: str, chunk_seconds: int = CHUNK_SIZE_SECONDS) -> List[str]:
+    """
+    Split audio into mono 16k wav chunks.
+    """
+    chunk_dir = f"{file_path}_chunks"
+    os.makedirs(chunk_dir, exist_ok=True)
 
+    output_pattern = os.path.join(chunk_dir, "chunk_%03d.wav")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        file_path,
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_seconds),
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        output_pattern,
+    ]
+
+    subprocess.run(cmd, check=True, capture_output=True)
+
+    chunk_paths = sorted(
+        os.path.join(chunk_dir, name)
+        for name in os.listdir(chunk_dir)
+        if name.startswith("chunk_") and name.endswith(".wav")
+    )
+
+    if not chunk_paths:
+        raise RuntimeError("Audio chunking produced no output files")
+
+    return chunk_paths
+
+
+def cleanup_chunk_files(chunk_paths: List[str]) -> None:
+    if not chunk_paths:
+        return
+
+    for path in chunk_paths:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    chunk_dir = os.path.dirname(chunk_paths[0])
+    try:
+        if os.path.isdir(chunk_dir) and not os.listdir(chunk_dir):
+            os.rmdir(chunk_dir)
+    except Exception:
+        pass
+
+
+def merge_chunk_results(chunk_results: List[Dict[str, Any]], chunk_durations: List[float]) -> Dict[str, Any]:
+
+    merged_segments: List[Dict[str, Any]] = []
+    merged_text_parts: List[str] = []
+
+    offset = 0.0
+
+    for result, duration in zip(chunk_results, chunk_durations):
+
+        chunk_text = (result.get("text") or "").strip()
+        if chunk_text:
+            merged_text_parts.append(chunk_text)
+
+        for seg in _segments_from_result(result):
+
+            merged_segments.append(
+                {
+                    "start": float(seg.get("start", 0.0)) + offset,
+                    "end": float(seg.get("end", 0.0)) + offset,
+                    "text": (seg.get("text") or "").strip(),
+                }
+            )
+
+        offset += duration
+
+    return {
+        "text": " ".join(merged_text_parts).strip(),
+        "segments": merged_segments,
+    }
+
+
+async def transcribe_with_optional_chunking(file_path: str, language: str) -> Dict[str, Any]:
+
+    total_duration = get_audio_duration_seconds(file_path)
+
+    if total_duration <= CHUNK_IF_LONGER_THAN_SECONDS:
+        return await asyncio.to_thread(
+            transcribe_audio,
+            file_path,
+            language=language,
+        )
+
+    print(
+        f"Audio exceeds {CHUNK_IF_LONGER_THAN_SECONDS}s; "
+        f"chunking into {CHUNK_SIZE_SECONDS}s segments"
+    )
+
+    chunk_paths = split_audio_into_chunks(file_path, CHUNK_SIZE_SECONDS)
+
+    try:
+
+        chunk_results: List[Dict[str, Any]] = []
+        chunk_durations: List[float] = []
+
+        for chunk_path in chunk_paths:
+
+            duration = get_audio_duration_seconds(chunk_path)
+            chunk_durations.append(duration)
+
+            result = await asyncio.to_thread(
+                transcribe_audio,
+                chunk_path,
+                language=language,
+            )
+
+            chunk_results.append(result)
+
+        return merge_chunk_results(chunk_results, chunk_durations)
+
+    finally:
+        cleanup_chunk_files(chunk_paths)
+# ---------------------------------------------------------
+# Cost Estimation
+# ---------------------------------------------------------
+def estimate_cost_usd(audio_duration_seconds: float) -> float:
+    """
+    Conservative placeholder estimate.
+    Refine later using real observed GCP costs.
+    """
+
+    estimated = audio_duration_seconds * 0.0008
+
+    return round(estimated, 4)
 # ---------------------------------------------------------
 # Run Job
 # ---------------------------------------------------------
@@ -270,7 +407,7 @@ async def run_job(job_id: str):
             ),
             timeout=PROCESS_ATTEMPT_TIMEOUT_SECONDS,
         )
-
+        result["speaker_segments"] = speaker_segments
         save_outputs(storage, job_id, result)
 
         processing_time_seconds = round(time.time() - start_time, 3)
@@ -364,3 +501,170 @@ def process_next_job(worker_id: str):
     print("Worker finished.")
 
     return True
+# ---------------------------------------------------------
+# SRT
+# ---------------------------------------------------------
+def _segments_to_srt(segments: List[Dict[str, Any]]) -> str:
+
+    lines = []
+    idx = 1
+
+    for s in segments:
+
+        start = s.get("start")
+        end = s.get("end")
+        text = (s.get("text") or "").strip()
+
+        if start is None or end is None or not text:
+            continue
+
+        lines.append(str(idx))
+        lines.append(
+            f"{_format_srt_time(float(start))} --> {_format_srt_time(float(end))}"
+        )
+        lines.append(text)
+        lines.append("")
+
+        idx += 1
+
+    return "\n".join(lines).strip() + "\n"
+
+
+# ---------------------------------------------------------
+# VTT
+# ---------------------------------------------------------
+def _segments_to_vtt(segments: List[Dict[str, Any]]) -> str:
+
+    lines = ["WEBVTT", ""]
+
+    for s in segments:
+
+        start = s.get("start")
+        end = s.get("end")
+        text = (s.get("text") or "").strip()
+
+        if start is None or end is None or not text:
+            continue
+
+        lines.append(
+            f"{_format_vtt_time(float(start))} --> {_format_vtt_time(float(end))}"
+        )
+        lines.append(text)
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+# ---------------------------------------------------------
+# Podcast HTML Transcript
+# ---------------------------------------------------------
+def _build_podcast_html(job_id: str, segments: List[Dict[str, Any]]) -> str:
+
+    blocks = []
+
+    speaker = 1
+    last_end = None
+    buffer = ""
+
+    for seg in segments:
+
+        start = float(seg["start"])
+        end = float(seg["end"])
+        text = seg["text"].strip()
+
+        if last_end is not None and start - last_end > 1.2:
+
+            blocks.append((speaker, last_end, buffer))
+
+            speaker = 2 if speaker == 1 else 1
+            buffer = text
+
+        else:
+
+            buffer += " " + text
+
+        last_end = end
+
+    if buffer:
+        blocks.append((speaker, last_end, buffer))
+
+    html = [
+        "<html>",
+        "<head>",
+        "<meta charset='utf-8'>",
+        "<title>Transcript</title>",
+        "</head>",
+        "<body>",
+        "<h1>Podcast Transcript</h1>",
+    ]
+
+    for spk, time_value, text in blocks:
+
+        html.append(
+            f"<p><strong>Speaker {spk} ({_format_hhmmss(time_value)})</strong></p>"
+        )
+
+        html.append(f"<p>{text.strip()}</p>")
+
+    html.append("</body></html>")
+
+    return "\n".join(html)
+
+
+# ---------------------------------------------------------
+# Save Outputs
+# ---------------------------------------------------------
+def save_outputs(storage, job_id: str, result: Dict[str, Any]):
+
+    text = (result.get("text") or "").strip()
+
+    storage.save_output(
+        job_id,
+        "transcript.txt",
+        (text + "\n").encode("utf-8"),
+        "text/plain; charset=utf-8",
+    )
+
+    doc = Document()
+
+    for line in text.split("\n"):
+        doc.add_paragraph(line)
+
+    buf = BytesIO()
+    doc.save(buf)
+
+    storage.save_output(
+        job_id,
+        "transcript.docx",
+        buf.getvalue(),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+    segments = _segments_from_result(result)
+
+    if segments:
+
+        srt = _segments_to_srt(segments)
+        vtt = _segments_to_vtt(segments)
+        html = _build_podcast_html(job_id, segments)
+
+        storage.save_output(
+            job_id,
+            "transcript.srt",
+            srt.encode("utf-8"),
+            "application/x-subrip",
+        )
+
+        storage.save_output(
+            job_id,
+            "transcript.vtt",
+            vtt.encode("utf-8"),
+            "text/vtt; charset=utf-8",
+        )
+
+        storage.save_output(
+            job_id,
+            "transcript.html",
+            html.encode("utf-8"),
+            "text/html; charset=utf-8",
+        )
