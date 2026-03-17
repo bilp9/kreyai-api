@@ -20,7 +20,7 @@ from app.constants import (
 )
 
 from app.transcription.engine import transcribe_audio
-from app.transcription.diarization import diarize_audio  # NEW
+from app.transcription.diarization import diarize_audio
 from app.storage.backend import get_storage
 from app.events.recorder import record_event
 
@@ -303,6 +303,8 @@ async def transcribe_with_optional_chunking(file_path: str, language: str) -> Di
 
     finally:
         cleanup_chunk_files(chunk_paths)
+
+
 # ---------------------------------------------------------
 # Cost Estimation
 # ---------------------------------------------------------
@@ -315,6 +317,45 @@ def estimate_cost_usd(audio_duration_seconds: float) -> float:
     estimated = audio_duration_seconds * 0.0008
 
     return round(estimated, 4)
+
+
+# ---------------------------------------------------------
+# Align Whisper segments with diarization speakers
+# ---------------------------------------------------------
+def align_speakers(result: Dict[str, Any], speaker_segments: List[Dict[str, Any]]) -> None:
+    """
+    Attach speaker labels to whisper segments in-place using the
+    diarization segment with the greatest overlap.
+    """
+
+    if not speaker_segments:
+        return
+
+    segments = _segments_from_result(result)
+
+    for seg in segments:
+
+        seg_start = float(seg.get("start", 0.0))
+        seg_end = float(seg.get("end", 0.0))
+
+        best_speaker = None
+        best_overlap = 0.0
+
+        for spk in speaker_segments:
+
+            spk_start = float(spk.get("start", 0.0))
+            spk_end = float(spk.get("end", 0.0))
+
+            overlap = min(seg_end, spk_end) - max(seg_start, spk_start)
+
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = spk.get("speaker")
+
+        if best_speaker:
+            seg["speaker"] = best_speaker
+
+
 # ---------------------------------------------------------
 # Run Job
 # ---------------------------------------------------------
@@ -359,7 +400,7 @@ async def run_job(job_id: str):
         file_size_bytes = None
         audio_duration_seconds = None
         processing_time_seconds = None
-        estimated_cost_usd = None
+        estimated_cost_value = None
         realtime_factor = None
 
         storage = get_storage()
@@ -372,7 +413,7 @@ async def run_job(job_id: str):
         storage.download_to_file(source_blob, local_path)
 
         # ---------------------------------------------------------
-        # NEW: Run speaker diarization before transcription
+        # Run speaker diarization before transcription
         # ---------------------------------------------------------
         try:
             print("Running speaker diarization...")
@@ -384,7 +425,6 @@ async def run_job(job_id: str):
         except Exception as diarization_error:
             print("Diarization failed but continuing transcription:", diarization_error)
             speaker_segments = []
-
         # ---------------------------------------------------------
 
         if os.path.exists(local_path):
@@ -407,11 +447,14 @@ async def run_job(job_id: str):
             ),
             timeout=PROCESS_ATTEMPT_TIMEOUT_SECONDS,
         )
+
+        align_speakers(result, speaker_segments)
         result["speaker_segments"] = speaker_segments
+
         save_outputs(storage, job_id, result)
 
         processing_time_seconds = round(time.time() - start_time, 3)
-        estimated_cost_usd = estimate_cost_usd(audio_duration_seconds or 0.0)
+        estimated_cost_value = estimate_cost_usd(audio_duration_seconds or 0.0)
 
         if audio_duration_seconds:
             realtime_factor = round(
@@ -429,7 +472,7 @@ async def run_job(job_id: str):
                 "file_size_bytes": file_size_bytes,
                 "audio_duration_seconds": audio_duration_seconds,
                 "processing_time_seconds": processing_time_seconds,
-                "estimated_cost_usd": estimated_cost_usd,
+                "estimated_cost_usd": estimated_cost_value,
                 "realtime_factor": realtime_factor,
                 "model": "faster-whisper",
                 "language_final": job.get("language", "auto"),
@@ -501,6 +544,8 @@ def process_next_job(worker_id: str):
     print("Worker finished.")
 
     return True
+
+
 # ---------------------------------------------------------
 # SRT
 # ---------------------------------------------------------
@@ -514,6 +559,10 @@ def _segments_to_srt(segments: List[Dict[str, Any]]) -> str:
         start = s.get("start")
         end = s.get("end")
         text = (s.get("text") or "").strip()
+        speaker = s.get("speaker")
+
+        if speaker and text:
+            text = f"{speaker}: {text}"
 
         if start is None or end is None or not text:
             continue
@@ -542,6 +591,10 @@ def _segments_to_vtt(segments: List[Dict[str, Any]]) -> str:
         start = s.get("start")
         end = s.get("end")
         text = (s.get("text") or "").strip()
+        speaker = s.get("speaker")
+
+        if speaker and text:
+            text = f"{speaker}: {text}"
 
         if start is None or end is None or not text:
             continue
@@ -562,31 +615,45 @@ def _build_podcast_html(job_id: str, segments: List[Dict[str, Any]]) -> str:
 
     blocks = []
 
-    speaker = 1
-    last_end = None
-    buffer = ""
+    current_speaker = None
+    current_start = None
+    buffer_parts: List[str] = []
 
     for seg in segments:
 
         start = float(seg["start"])
         end = float(seg["end"])
         text = seg["text"].strip()
+        speaker = seg.get("speaker")
 
-        if last_end is not None and start - last_end > 1.2:
+        if not text:
+            continue
 
-            blocks.append((speaker, last_end, buffer))
-
-            speaker = 2 if speaker == 1 else 1
-            buffer = text
-
+        if speaker:
+            if current_speaker is None:
+                current_speaker = speaker
+                current_start = start
+                buffer_parts = [text]
+            elif speaker == current_speaker:
+                buffer_parts.append(text)
+            else:
+                blocks.append((current_speaker, current_start, " ".join(buffer_parts).strip()))
+                current_speaker = speaker
+                current_start = start
+                buffer_parts = [text]
         else:
+            # Fallback: treat unlabeled speech as its own running block
+            if current_speaker is None:
+                current_speaker = "Speaker"
+                current_start = start
+                buffer_parts = [text]
+            else:
+                buffer_parts.append(text)
 
-            buffer += " " + text
+        _ = end  # keep end consumed without changing structure
 
-        last_end = end
-
-    if buffer:
-        blocks.append((speaker, last_end, buffer))
+    if buffer_parts:
+        blocks.append((current_speaker or "Speaker", current_start or 0.0, " ".join(buffer_parts).strip()))
 
     html = [
         "<html>",
@@ -599,11 +666,9 @@ def _build_podcast_html(job_id: str, segments: List[Dict[str, Any]]) -> str:
     ]
 
     for spk, time_value, text in blocks:
-
         html.append(
-            f"<p><strong>Speaker {spk} ({_format_hhmmss(time_value)})</strong></p>"
+            f"<p><strong>{spk} ({_format_hhmmss(float(time_value))})</strong></p>"
         )
-
         html.append(f"<p>{text.strip()}</p>")
 
     html.append("</body></html>")
