@@ -324,8 +324,9 @@ def estimate_cost_usd(audio_duration_seconds: float) -> float:
 # ---------------------------------------------------------
 def align_speakers(result: Dict[str, Any], speaker_segments: List[Dict[str, Any]]) -> None:
     """
-    Attach speaker labels to whisper segments in-place using the
-    diarization segment with the greatest overlap.
+    Attach speaker labels using:
+    1. Best overlap
+    2. Fallback to closest segment (midpoint distance)
     """
 
     if not speaker_segments:
@@ -337,10 +338,12 @@ def align_speakers(result: Dict[str, Any], speaker_segments: List[Dict[str, Any]
 
         seg_start = float(seg.get("start", 0.0))
         seg_end = float(seg.get("end", 0.0))
+        seg_mid = (seg_start + seg_end) / 2
 
         best_speaker = None
         best_overlap = 0.0
 
+        # First pass: overlap
         for spk in speaker_segments:
 
             spk_start = float(spk.get("start", 0.0))
@@ -352,9 +355,25 @@ def align_speakers(result: Dict[str, Any], speaker_segments: List[Dict[str, Any]
                 best_overlap = overlap
                 best_speaker = spk.get("speaker")
 
+        # Fallback: closest midpoint
+        if not best_speaker:
+
+            closest_speaker = None
+            closest_distance = float("inf")
+
+            for spk in speaker_segments:
+
+                spk_mid = (float(spk["start"]) + float(spk["end"])) / 2
+                distance = abs(seg_mid - spk_mid)
+
+                if distance < closest_distance:
+                    closest_distance = distance
+                    closest_speaker = spk.get("speaker")
+
+            best_speaker = closest_speaker
+
         if best_speaker:
             seg["speaker"] = best_speaker
-
 
 # ---------------------------------------------------------
 # Run Job
