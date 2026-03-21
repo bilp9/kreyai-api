@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import asyncio
 import os
 from datetime import datetime
 import time
+from html import escape
 from io import BytesIO
 from typing import Optional, Dict, Any, List
 
@@ -375,6 +377,15 @@ def align_speakers(result: Dict[str, Any], speaker_segments: List[Dict[str, Any]
         if best_speaker:
             seg["speaker"] = best_speaker
 
+
+def _count_speaker_labeled_segments(result: Dict[str, Any]) -> int:
+
+    return sum(
+        1
+        for seg in _segments_from_result(result)
+        if (seg.get("speaker") or "").strip()
+    )
+
 # ---------------------------------------------------------
 # Run Job
 # ---------------------------------------------------------
@@ -421,6 +432,10 @@ async def run_job(job_id: str):
         processing_time_seconds = None
         estimated_cost_value = None
         realtime_factor = None
+        diarization_error_message = None
+        diarization_status = "not_started"
+        speaker_segments: List[Dict[str, Any]] = []
+        labeled_segments_count = 0
 
         storage = get_storage()
 
@@ -441,8 +456,13 @@ async def run_job(job_id: str):
                 local_path
             )
             print(f"Diarization segments detected: {len(speaker_segments)}")
+            diarization_status = (
+                "completed" if speaker_segments else "completed_empty"
+            )
         except Exception as diarization_error:
             print("Diarization failed but continuing transcription:", diarization_error)
+            diarization_error_message = str(diarization_error)
+            diarization_status = "failed"
             speaker_segments = []
         # ---------------------------------------------------------
 
@@ -469,6 +489,11 @@ async def run_job(job_id: str):
 
         align_speakers(result, speaker_segments)
         result["speaker_segments"] = speaker_segments
+        result["diarization"] = {
+            "status": diarization_status,
+            "error": diarization_error_message,
+        }
+        labeled_segments_count = _count_speaker_labeled_segments(result)
 
         save_outputs(storage, job_id, result)
 
@@ -495,6 +520,10 @@ async def run_job(job_id: str):
                 "realtime_factor": realtime_factor,
                 "model": "faster-whisper",
                 "language_final": job.get("language", "auto"),
+                "diarization_status": diarization_status,
+                "diarization_error": diarization_error_message,
+                "diarization_segments_count": len(speaker_segments),
+                "speaker_labeled_segments_count": labeled_segments_count,
             }
         )
 
@@ -533,6 +562,10 @@ async def run_job(job_id: str):
                 failure_update["processing_time_seconds"] = processing_time_seconds
             if realtime_factor is not None:
                 failure_update["realtime_factor"] = realtime_factor
+            failure_update["diarization_status"] = diarization_status
+            failure_update["diarization_error"] = diarization_error_message
+            failure_update["diarization_segments_count"] = len(speaker_segments)
+            failure_update["speaker_labeled_segments_count"] = labeled_segments_count
         except Exception:
             pass
 
@@ -661,13 +694,20 @@ def _build_podcast_html(job_id: str, segments: List[Dict[str, Any]]) -> str:
                 current_start = start
                 buffer_parts = [text]
         else:
-            # Fallback: treat unlabeled speech as its own running block
-            if current_speaker is None:
-                current_speaker = "Speaker"
-                current_start = start
-                buffer_parts = [text]
-            else:
-                buffer_parts.append(text)
+            # Keep unlabeled segments separate so timestamps still advance
+            # when diarization is empty or unavailable.
+            if buffer_parts:
+                blocks.append(
+                    (
+                        current_speaker or "Speaker",
+                        current_start or 0.0,
+                        " ".join(buffer_parts).strip(),
+                    )
+                )
+                current_speaker = None
+                current_start = None
+                buffer_parts = []
+            blocks.append(("Speaker", start, text))
 
         _ = end  # keep end consumed without changing structure
 
@@ -686,9 +726,9 @@ def _build_podcast_html(job_id: str, segments: List[Dict[str, Any]]) -> str:
 
     for spk, time_value, text in blocks:
         html.append(
-            f"<p><strong>{spk} ({_format_hhmmss(float(time_value))})</strong></p>"
+            f"<p><strong>{escape(str(spk))} ({_format_hhmmss(float(time_value))})</strong></p>"
         )
-        html.append(f"<p>{text.strip()}</p>")
+        html.append(f"<p>{escape(text.strip())}</p>")
 
     html.append("</body></html>")
 
@@ -723,6 +763,15 @@ def save_outputs(storage, job_id: str, result: Dict[str, Any]):
         buf.getvalue(),
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+    speaker_segments = result.get("speaker_segments")
+    if isinstance(speaker_segments, list):
+        storage.save_output(
+            job_id,
+            "speaker_segments.json",
+            (json.dumps(speaker_segments, indent=2) + "\n").encode("utf-8"),
+            "application/json; charset=utf-8",
+        )
 
     segments = _segments_from_result(result)
 
