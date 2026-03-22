@@ -6,8 +6,9 @@ import asyncio
 import os
 import time
 import uuid
+from collections import defaultdict, deque
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Deque, Dict, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
@@ -15,6 +16,13 @@ from pydantic import BaseModel
 
 from app.config import get_language_label, get_public_api_version, get_public_language_options, get_public_supported_language_codes
 from app.constants import JobStatus, JOB_ID_PREFIX
+from app.constants import (
+    PUBLIC_CREATE_JOB_RATE_LIMIT,
+    PUBLIC_RATE_LIMIT_WINDOW_SECONDS,
+    PUBLIC_VERIFY_RATE_LIMIT,
+    VERIFICATION_LOCKOUT_SECONDS,
+    VERIFICATION_MAX_ATTEMPTS,
+)
 from app.state.firestore_jobs import (
     create_job as fs_create_job,
     get_job as fs_get_job,
@@ -34,10 +42,42 @@ from app.security.job_tokens import (
 )
 
 router = APIRouter(prefix="/api", tags=["jobs"])
+_PUBLIC_RATE_LIMITS: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
 
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utcnow_ts() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+
+def _client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    if request.client and request.client.host:
+        return str(request.client.host)
+    return "unknown"
+
+
+def _enforce_public_rate_limit(request: Request, *, scope: str, limit: int) -> None:
+    now = time.monotonic()
+    key = (scope, _client_ip(request))
+    hits = _PUBLIC_RATE_LIMITS[key]
+    window_seconds = PUBLIC_RATE_LIMIT_WINDOW_SECONDS
+
+    while hits and now - hits[0] >= window_seconds:
+        hits.popleft()
+
+    if len(hits) >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Please wait a moment and try again.",
+        )
+
+    hits.append(now)
 
 
 def _normalize_requested_language(language: str) -> str:
@@ -116,12 +156,18 @@ def _require_token(request: Request, job_id: str) -> None:
 
 @router.post("/")
 async def create_job_route(
+    request: Request,
     background_tasks: BackgroundTasks,
     response: Response,
     email: str = Body(...),
     language: str = Body("auto"),
     accepted_terms: bool = Body(False),
 ):
+    _enforce_public_rate_limit(
+        request,
+        scope="create_job",
+        limit=PUBLIC_CREATE_JOB_RATE_LIMIT,
+    )
     started_at = time.perf_counter()
     language = _normalize_requested_language(language)
 
@@ -174,12 +220,36 @@ async def create_job_route(
 # -------------------------------------------------
 
 @router.post("/verify")
-def verify_job_route(job_id: str, code: str):
+def verify_job_route(job_id: str, code: str, request: Request):
+    _enforce_public_rate_limit(
+        request,
+        scope="verify_job",
+        limit=PUBLIC_VERIFY_RATE_LIMIT,
+    )
     job = fs_get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
 
+    if job.get("verified"):
+        raise HTTPException(400, "Job already verified")
+
+    now_ts = _utcnow_ts()
+    locked_until = float(job.get("verification_locked_until") or 0.0)
+    if locked_until > now_ts:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many verification attempts. Please try again later.",
+        )
+
     if code != job.get("verification_code"):
+        attempts = int(job.get("verification_attempts") or 0) + 1
+        updates = {
+            "verification_attempts": attempts,
+            "updated_at": _utcnow_iso(),
+        }
+        if attempts >= VERIFICATION_MAX_ATTEMPTS:
+            updates["verification_locked_until"] = now_ts + VERIFICATION_LOCKOUT_SECONDS
+        fs_update_job(job_id, updates)
         raise HTTPException(400, "Invalid verification code")
 
     fs_update_job(
@@ -187,6 +257,9 @@ def verify_job_route(job_id: str, code: str):
         {
             "verified": True,
             "status": JobStatus.VERIFIED,
+            "verification_attempts": 0,
+            "verification_locked_until": None,
+            "verified_at": _utcnow_iso(),
             "updated_at": _utcnow_iso(),
         },
     )
