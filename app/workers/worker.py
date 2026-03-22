@@ -16,8 +16,10 @@ def worker_loop() -> None:
     """
     worker_id = os.getenv("WORKER_ID", "cloudrun-worker")
     poll_seconds = float(os.getenv("WORKER_POLL_SECONDS", "1.0"))
+    hf_token_present = bool(os.getenv("HF_TOKEN"))
 
     print(f"🚀 Worker starting... id={worker_id}")
+    print(f"🔐 HF_TOKEN configured: {hf_token_present}")
 
     processed_any = False
 

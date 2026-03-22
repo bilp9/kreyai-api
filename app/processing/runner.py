@@ -21,8 +21,11 @@ from app.constants import (
     MAX_AUDIO_DURATION_SECONDS,
 )
 
-from app.transcription.engine import transcribe_audio
-from app.transcription.diarization import diarize_audio
+from app.transcription.engine import transcribe_audio, normalize_language_code
+from app.transcription.diarization import (
+    diarize_audio,
+    get_diarization_configuration_error,
+)
 from app.storage.backend import get_storage
 from app.events.recorder import record_event
 
@@ -131,6 +134,119 @@ def _format_hhmmss(seconds: float) -> str:
     ss = total % 60
 
     return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
+def _split_transcript_paragraphs(
+    text: str,
+    *,
+    target_chars: int = 420,
+    hard_limit_chars: int = 650,
+) -> List[str]:
+
+    normalized = " ".join((text or "").split()).strip()
+    if not normalized:
+        return []
+
+    parts: List[str] = []
+    remaining = normalized
+
+    while remaining:
+        if len(remaining) <= hard_limit_chars:
+            parts.append(remaining)
+            break
+
+        search_window = remaining[:hard_limit_chars]
+        split_at = -1
+
+        if len(search_window) >= target_chars:
+            for marker in (". ", "? ", "! ", "; ", ": "):
+                idx = search_window.rfind(marker, target_chars // 2)
+                if idx > split_at:
+                    split_at = idx + len(marker) - 1
+
+        if split_at <= 0:
+            split_at = search_window.rfind(" ", target_chars, hard_limit_chars)
+
+        if split_at <= 0:
+            split_at = hard_limit_chars
+
+        parts.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+
+    return [part for part in parts if part]
+
+
+def _build_transcript_blocks(
+    segments: List[Dict[str, Any]],
+) -> List[tuple[str, float, str]]:
+
+    blocks: List[tuple[str, float, str]] = []
+    current_speaker = None
+    current_start = None
+    buffer_parts: List[str] = []
+
+    for seg in segments:
+        start = float(seg["start"])
+        end = float(seg["end"])
+        text = seg["text"].strip()
+        speaker = seg.get("speaker")
+
+        if not text:
+            continue
+
+        if speaker:
+            if current_speaker is None:
+                current_speaker = speaker
+                current_start = start
+                buffer_parts = [text]
+            elif speaker == current_speaker:
+                buffer_parts.append(text)
+            else:
+                blocks.append(
+                    (str(current_speaker), float(current_start or 0.0), " ".join(buffer_parts).strip())
+                )
+                current_speaker = speaker
+                current_start = start
+                buffer_parts = [text]
+        else:
+            if buffer_parts:
+                blocks.append(
+                    (
+                        str(current_speaker or "Speaker"),
+                        float(current_start or 0.0),
+                        " ".join(buffer_parts).strip(),
+                    )
+                )
+                current_speaker = None
+                current_start = None
+                buffer_parts = []
+            blocks.append(("Speaker", start, text))
+
+        _ = end
+
+    if buffer_parts:
+        blocks.append(
+            (
+                str(current_speaker or "Speaker"),
+                float(current_start or 0.0),
+                " ".join(buffer_parts).strip(),
+            )
+        )
+
+    return blocks
+
+
+def _build_transcript_text(segments: List[Dict[str, Any]]) -> str:
+
+    lines: List[str] = []
+
+    for speaker, time_value, text in _build_transcript_blocks(segments):
+        lines.append(f"{speaker} ({_format_hhmmss(time_value)})")
+        for paragraph in _split_transcript_paragraphs(text):
+            lines.append(paragraph)
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n" if lines else ""
 
 
 # ---------------------------------------------------------
@@ -248,12 +364,36 @@ def merge_chunk_results(chunk_results: List[Dict[str, Any]], chunk_durations: Li
             merged_text_parts.append(chunk_text)
 
         for seg in _segments_from_result(result):
+            merged_words = []
+            for word in seg.get("words") or []:
+                if not isinstance(word, dict):
+                    continue
+
+                word_start = word.get("start")
+                word_end = word.get("end")
+
+                merged_words.append(
+                    {
+                        **word,
+                        "start": (
+                            float(word_start) + offset
+                            if word_start is not None
+                            else None
+                        ),
+                        "end": (
+                            float(word_end) + offset
+                            if word_end is not None
+                            else None
+                        ),
+                    }
+                )
 
             merged_segments.append(
                 {
                     "start": float(seg.get("start", 0.0)) + offset,
                     "end": float(seg.get("end", 0.0)) + offset,
                     "text": (seg.get("text") or "").strip(),
+                    "words": merged_words,
                 }
             )
 
@@ -324,58 +464,162 @@ def estimate_cost_usd(audio_duration_seconds: float) -> float:
 # ---------------------------------------------------------
 # Align Whisper segments with diarization speakers
 # ---------------------------------------------------------
+def _find_best_speaker(
+    start: float,
+    end: float,
+    speaker_segments: List[Dict[str, Any]],
+) -> Optional[str]:
+
+    mid = (start + end) / 2
+    best_speaker = None
+    best_overlap = 0.0
+
+    for spk in speaker_segments:
+        spk_start = float(spk.get("start", 0.0))
+        spk_end = float(spk.get("end", 0.0))
+        overlap = min(end, spk_end) - max(start, spk_start)
+
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_speaker = spk.get("speaker")
+
+    if best_speaker:
+        return str(best_speaker)
+
+    closest_speaker = None
+    closest_distance = float("inf")
+
+    for spk in speaker_segments:
+        spk_mid = (float(spk.get("start", 0.0)) + float(spk.get("end", 0.0))) / 2
+        distance = abs(mid - spk_mid)
+
+        if distance < closest_distance:
+            closest_distance = distance
+            closest_speaker = spk.get("speaker")
+
+    return str(closest_speaker) if closest_speaker else None
+
+
+def _combine_words_text(words: List[Dict[str, Any]]) -> str:
+    return "".join(str(word.get("word") or "") for word in words).strip()
+
+
+def _normalize_text_for_alignment(text: str) -> str:
+    return "".join(
+        ch.lower()
+        for ch in str(text or "")
+        if ch.isalnum()
+    )
+
+
+def _split_segment_by_speaker(
+    seg: Dict[str, Any],
+    speaker_segments: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+
+    seg_start = float(seg.get("start", 0.0))
+    seg_end = float(seg.get("end", 0.0))
+    seg_text = (seg.get("text") or "").strip()
+    words = [
+        word for word in (seg.get("words") or [])
+        if isinstance(word, dict) and (word.get("word") or "").strip()
+    ]
+
+    if not words:
+        speaker = _find_best_speaker(seg_start, seg_end, speaker_segments)
+        split_seg = dict(seg)
+        if speaker:
+            split_seg["speaker"] = speaker
+        return [split_seg]
+
+    combined_words_text = _combine_words_text(words)
+    if (
+        _normalize_text_for_alignment(seg_text)
+        and _normalize_text_for_alignment(combined_words_text)
+        and _normalize_text_for_alignment(seg_text)
+        != _normalize_text_for_alignment(combined_words_text)
+    ):
+        speaker = _find_best_speaker(seg_start, seg_end, speaker_segments)
+        split_seg = dict(seg)
+        if speaker:
+            split_seg["speaker"] = speaker
+        return [split_seg]
+
+    annotated_words: List[Dict[str, Any]] = []
+    for word in words:
+        word_start = word.get("start")
+        word_end = word.get("end")
+
+        if word_start is None or word_end is None:
+            speaker = _find_best_speaker(seg_start, seg_end, speaker_segments)
+        else:
+            speaker = _find_best_speaker(float(word_start), float(word_end), speaker_segments)
+
+        annotated_words.append({**word, "speaker": speaker})
+
+    split_segments: List[Dict[str, Any]] = []
+    current_words: List[Dict[str, Any]] = []
+    current_speaker: Optional[str] = None
+
+    def flush() -> None:
+        nonlocal current_words, current_speaker
+        if not current_words:
+            return
+
+        split_text = _combine_words_text(current_words) or seg_text
+        split_start = current_words[0].get("start")
+        split_end = current_words[-1].get("end")
+
+        split_seg = {
+            "start": float(split_start) if split_start is not None else seg_start,
+            "end": float(split_end) if split_end is not None else seg_end,
+            "text": split_text,
+            "words": [{k: v for k, v in word.items() if k != "speaker"} for word in current_words],
+        }
+        if current_speaker:
+            split_seg["speaker"] = current_speaker
+        split_segments.append(split_seg)
+        current_words = []
+        current_speaker = None
+
+    for word in annotated_words:
+        word_speaker = word.get("speaker")
+        if current_words and word_speaker != current_speaker:
+            flush()
+
+        if not current_words:
+            current_speaker = str(word_speaker) if word_speaker else None
+
+        current_words.append(word)
+
+    flush()
+
+    if not split_segments:
+        split_seg = dict(seg)
+        speaker = _find_best_speaker(seg_start, seg_end, speaker_segments)
+        if speaker:
+            split_seg["speaker"] = speaker
+        return [split_seg]
+
+    return split_segments
+
+
 def align_speakers(result: Dict[str, Any], speaker_segments: List[Dict[str, Any]]) -> None:
     """
-    Attach speaker labels using:
-    1. Best overlap
-    2. Fallback to closest segment (midpoint distance)
+    Split transcript segments on speaker changes and attach speaker labels using
+    diarization overlap, with midpoint fallback when overlap is ambiguous.
     """
 
     if not speaker_segments:
         return
 
     segments = _segments_from_result(result)
+    split_segments: List[Dict[str, Any]] = []
 
     for seg in segments:
+        split_segments.extend(_split_segment_by_speaker(seg, speaker_segments))
 
-        seg_start = float(seg.get("start", 0.0))
-        seg_end = float(seg.get("end", 0.0))
-        seg_mid = (seg_start + seg_end) / 2
-
-        best_speaker = None
-        best_overlap = 0.0
-
-        # First pass: overlap
-        for spk in speaker_segments:
-
-            spk_start = float(spk.get("start", 0.0))
-            spk_end = float(spk.get("end", 0.0))
-
-            overlap = min(seg_end, spk_end) - max(seg_start, spk_start)
-
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = spk.get("speaker")
-
-        # Fallback: closest midpoint
-        if not best_speaker:
-
-            closest_speaker = None
-            closest_distance = float("inf")
-
-            for spk in speaker_segments:
-
-                spk_mid = (float(spk["start"]) + float(spk["end"])) / 2
-                distance = abs(seg_mid - spk_mid)
-
-                if distance < closest_distance:
-                    closest_distance = distance
-                    closest_speaker = spk.get("speaker")
-
-            best_speaker = closest_speaker
-
-        if best_speaker:
-            seg["speaker"] = best_speaker
+    result["segments"] = split_segments
 
 
 def _count_speaker_labeled_segments(result: Dict[str, Any]) -> int:
@@ -432,6 +676,11 @@ async def run_job(job_id: str):
         processing_time_seconds = None
         estimated_cost_value = None
         realtime_factor = None
+        download_time_seconds = None
+        diarization_time_seconds = None
+        transcription_time_seconds = None
+        alignment_time_seconds = None
+        output_time_seconds = None
         diarization_error_message = None
         diarization_status = "not_started"
         speaker_segments: List[Dict[str, Any]] = []
@@ -440,30 +689,50 @@ async def run_job(job_id: str):
         storage = get_storage()
 
         source_blob = job.get("file_path") or job.get("upload_path")
+        requested_language = normalize_language_code(job.get("language", "auto")) or "auto"
 
         if not source_blob:
             raise RuntimeError("Job missing storage path")
 
+        download_start_time = time.time()
         storage.download_to_file(source_blob, local_path)
+        download_time_seconds = round(time.time() - download_start_time, 3)
 
         # ---------------------------------------------------------
         # Run speaker diarization before transcription
         # ---------------------------------------------------------
-        try:
-            print("Running speaker diarization...")
-            speaker_segments = await asyncio.to_thread(
-                diarize_audio,
-                local_path
+        diarization_config_error = get_diarization_configuration_error()
+        if diarization_config_error:
+            diarization_error_message = diarization_config_error
+            diarization_status = "misconfigured"
+            diarization_time_seconds = 0.0
+            print(
+                "Skipping speaker diarization due to configuration issue:",
+                diarization_error_message,
             )
-            print(f"Diarization segments detected: {len(speaker_segments)}")
-            diarization_status = (
-                "completed" if speaker_segments else "completed_empty"
-            )
-        except Exception as diarization_error:
-            print("Diarization failed but continuing transcription:", diarization_error)
-            diarization_error_message = str(diarization_error)
-            diarization_status = "failed"
-            speaker_segments = []
+        else:
+            try:
+                print("Running speaker diarization...")
+                diarization_start_time = time.time()
+                speaker_segments = await asyncio.to_thread(
+                    diarize_audio,
+                    local_path
+                )
+                diarization_time_seconds = round(time.time() - diarization_start_time, 3)
+                print(f"Diarization segments detected: {len(speaker_segments)}")
+                diarization_status = (
+                    "completed" if speaker_segments else "completed_empty"
+                )
+            except Exception as diarization_error:
+                diarization_time_seconds = round(time.time() - diarization_start_time, 3)
+                print("Diarization failed but continuing transcription:", diarization_error)
+                diarization_error_message = str(diarization_error)
+                lowered_diarization_error = diarization_error_message.lower()
+                if "hf_token" in lowered_diarization_error or "hugging face" in lowered_diarization_error:
+                    diarization_status = "misconfigured"
+                else:
+                    diarization_status = "failed"
+                speaker_segments = []
         # ---------------------------------------------------------
 
         if os.path.exists(local_path):
@@ -479,15 +748,19 @@ async def run_job(job_id: str):
                 f"Audio exceeds maximum allowed duration ({MAX_AUDIO_DURATION_SECONDS} seconds)"
             )
 
+        transcription_start_time = time.time()
         result = await asyncio.wait_for(
             transcribe_with_optional_chunking(
                 local_path,
-                language=job.get("language", "auto"),
+                language=requested_language,
             ),
             timeout=PROCESS_ATTEMPT_TIMEOUT_SECONDS,
         )
+        transcription_time_seconds = round(time.time() - transcription_start_time, 3)
 
+        alignment_start_time = time.time()
         align_speakers(result, speaker_segments)
+        alignment_time_seconds = round(time.time() - alignment_start_time, 3)
         result["speaker_segments"] = speaker_segments
         result["diarization"] = {
             "status": diarization_status,
@@ -495,7 +768,9 @@ async def run_job(job_id: str):
         }
         labeled_segments_count = _count_speaker_labeled_segments(result)
 
+        output_start_time = time.time()
         save_outputs(storage, job_id, result)
+        output_time_seconds = round(time.time() - output_start_time, 3)
 
         processing_time_seconds = round(time.time() - start_time, 3)
         estimated_cost_value = estimate_cost_usd(audio_duration_seconds or 0.0)
@@ -516,10 +791,15 @@ async def run_job(job_id: str):
                 "file_size_bytes": file_size_bytes,
                 "audio_duration_seconds": audio_duration_seconds,
                 "processing_time_seconds": processing_time_seconds,
+                "download_time_seconds": download_time_seconds,
+                "diarization_time_seconds": diarization_time_seconds,
+                "transcription_time_seconds": transcription_time_seconds,
+                "alignment_time_seconds": alignment_time_seconds,
+                "output_time_seconds": output_time_seconds,
                 "estimated_cost_usd": estimated_cost_value,
                 "realtime_factor": realtime_factor,
                 "model": "faster-whisper",
-                "language_final": job.get("language", "auto"),
+                "language_final": requested_language,
                 "diarization_status": diarization_status,
                 "diarization_error": diarization_error_message,
                 "diarization_segments_count": len(speaker_segments),
@@ -560,6 +840,16 @@ async def run_job(job_id: str):
                 failure_update["audio_duration_seconds"] = audio_duration_seconds
             if processing_time_seconds is not None:
                 failure_update["processing_time_seconds"] = processing_time_seconds
+            if download_time_seconds is not None:
+                failure_update["download_time_seconds"] = download_time_seconds
+            if diarization_time_seconds is not None:
+                failure_update["diarization_time_seconds"] = diarization_time_seconds
+            if transcription_time_seconds is not None:
+                failure_update["transcription_time_seconds"] = transcription_time_seconds
+            if alignment_time_seconds is not None:
+                failure_update["alignment_time_seconds"] = alignment_time_seconds
+            if output_time_seconds is not None:
+                failure_update["output_time_seconds"] = output_time_seconds
             if realtime_factor is not None:
                 failure_update["realtime_factor"] = realtime_factor
             failure_update["diarization_status"] = diarization_status
@@ -663,74 +953,159 @@ def _segments_to_vtt(segments: List[Dict[str, Any]]) -> str:
 # ---------------------------------------------------------
 # Podcast HTML Transcript
 # ---------------------------------------------------------
-def _build_podcast_html(job_id: str, segments: List[Dict[str, Any]]) -> str:
-
-    blocks = []
-
-    current_speaker = None
-    current_start = None
-    buffer_parts: List[str] = []
-
-    for seg in segments:
-
-        start = float(seg["start"])
-        end = float(seg["end"])
-        text = seg["text"].strip()
-        speaker = seg.get("speaker")
-
-        if not text:
-            continue
-
-        if speaker:
-            if current_speaker is None:
-                current_speaker = speaker
-                current_start = start
-                buffer_parts = [text]
-            elif speaker == current_speaker:
-                buffer_parts.append(text)
-            else:
-                blocks.append((current_speaker, current_start, " ".join(buffer_parts).strip()))
-                current_speaker = speaker
-                current_start = start
-                buffer_parts = [text]
-        else:
-            # Keep unlabeled segments separate so timestamps still advance
-            # when diarization is empty or unavailable.
-            if buffer_parts:
-                blocks.append(
-                    (
-                        current_speaker or "Speaker",
-                        current_start or 0.0,
-                        " ".join(buffer_parts).strip(),
-                    )
-                )
-                current_speaker = None
-                current_start = None
-                buffer_parts = []
-            blocks.append(("Speaker", start, text))
-
-        _ = end  # keep end consumed without changing structure
-
-    if buffer_parts:
-        blocks.append((current_speaker or "Speaker", current_start or 0.0, " ".join(buffer_parts).strip()))
+def _build_podcast_html(
+    job_id: str,
+    segments: List[Dict[str, Any]],
+    diarization: Optional[Dict[str, Any]] = None,
+) -> str:
+    blocks = _build_transcript_blocks(segments)
 
     html = [
-        "<html>",
+        "<!DOCTYPE html>",
+        "<html lang='en'>",
         "<head>",
         "<meta charset='utf-8'>",
-        "<title>Transcript</title>",
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>",
+        f"<title>Transcript {escape(job_id)}</title>",
+        "<style>",
+        ":root {",
+        "  color-scheme: light;",
+        "  --bg: #f6efe2;",
+        "  --panel: #fffdf9;",
+        "  --text: #1f1a17;",
+        "  --muted: #6f655c;",
+        "  --border: #e8dccd;",
+        "  --accent: #b25b2a;",
+        "  --accent-soft: #f6e5d8;",
+        "}",
+        "* { box-sizing: border-box; }",
+        "body {",
+        "  margin: 0;",
+        "  font-family: Georgia, 'Times New Roman', serif;",
+        "  background:",
+        "    radial-gradient(circle at top, #fff8ef 0%, var(--bg) 58%, #eadcca 100%);",
+        "  color: var(--text);",
+        "}",
+        ".page {",
+        "  width: min(900px, calc(100% - 24px));",
+        "  margin: 24px auto 48px;",
+        "}",
+        ".hero {",
+        "  background: linear-gradient(135deg, rgba(178, 91, 42, 0.10), rgba(255, 255, 255, 0.92));",
+        "  border: 1px solid var(--border);",
+        "  border-radius: 24px;",
+        "  padding: 24px 22px;",
+        "  box-shadow: 0 14px 40px rgba(78, 54, 31, 0.08);",
+        "}",
+        ".eyebrow {",
+        "  margin: 0 0 8px;",
+        "  font: 600 0.78rem/1.2 Arial, sans-serif;",
+        "  letter-spacing: 0.14em;",
+        "  text-transform: uppercase;",
+        "  color: var(--accent);",
+        "}",
+        "h1 {",
+        "  margin: 0;",
+        "  font-size: clamp(2rem, 4vw, 3.2rem);",
+        "  line-height: 0.96;",
+        "}",
+        ".subtitle {",
+        "  margin: 12px 0 0;",
+        "  color: var(--muted);",
+        "  font: 400 1rem/1.6 Arial, sans-serif;",
+        "}",
+        ".note {",
+        "  margin: 18px 0 0;",
+        "  padding: 12px 14px;",
+        "  border-left: 4px solid var(--accent);",
+        "  border-radius: 12px;",
+        "  background: var(--accent-soft);",
+        "  color: #5c331b;",
+        "  font: 400 0.95rem/1.5 Arial, sans-serif;",
+        "}",
+        ".transcript {",
+        "  display: grid;",
+        "  gap: 16px;",
+        "  margin-top: 20px;",
+        "}",
+        ".block {",
+        "  padding: 18px 18px 16px;",
+        "  border: 1px solid var(--border);",
+        "  border-radius: 20px;",
+        "  background: rgba(255, 253, 249, 0.96);",
+        "  box-shadow: 0 10px 26px rgba(78, 54, 31, 0.05);",
+        "}",
+        ".meta {",
+        "  display: flex;",
+        "  flex-wrap: wrap;",
+        "  gap: 8px 12px;",
+        "  align-items: baseline;",
+        "  margin-bottom: 10px;",
+        "}",
+        ".speaker {",
+        "  font: 700 0.96rem/1.2 Arial, sans-serif;",
+        "  letter-spacing: 0.06em;",
+        "  text-transform: uppercase;",
+        "}",
+        ".timestamp {",
+        "  color: var(--muted);",
+        "  font: 600 0.83rem/1.2 Arial, sans-serif;",
+        "}",
+        ".block p {",
+        "  margin: 0 0 12px;",
+        "  font-size: 1.18rem;",
+        "  line-height: 1.72;",
+        "}",
+        ".block p:last-child { margin-bottom: 0; }",
+        "@media (max-width: 640px) {",
+        "  .page { width: min(100% - 16px, 100%); margin: 12px auto 28px; }",
+        "  .hero { padding: 18px 16px; border-radius: 18px; }",
+        "  .block { padding: 14px 14px 12px; border-radius: 16px; }",
+        "  .block p { font-size: 1.04rem; line-height: 1.62; }",
+        "}",
+        "</style>",
         "</head>",
         "<body>",
+        "<main class='page'>",
+        "<section class='hero'>",
+        "<p class='eyebrow'>Transcript Export</p>",
         "<h1>Podcast Transcript</h1>",
+        f"<p class='subtitle'>Job {escape(job_id)}. Speaker-labeled transcript grouped into readable sections.</p>",
     ]
 
-    for spk, time_value, text in blocks:
-        html.append(
-            f"<p><strong>{escape(str(spk))} ({_format_hhmmss(float(time_value))})</strong></p>"
-        )
-        html.append(f"<p>{escape(text.strip())}</p>")
+    diarization = diarization or {}
+    diarization_status = str(diarization.get("status") or "").strip()
+    diarization_error = str(diarization.get("error") or "").strip()
 
-    html.append("</body></html>")
+    if diarization_status and diarization_status != "completed":
+        note = f"Speaker diarization unavailable ({diarization_status})."
+        if diarization_error:
+            note = f"{note} {diarization_error}"
+        html.append(f"<p class='note'>{escape(note)}</p>")
+
+    html.extend([
+        "</section>",
+        "<section class='transcript'>",
+    ])
+
+    for spk, time_value, text in blocks:
+        html.append("<article class='block'>")
+        html.append(
+            "<div class='meta'>"
+            f"<span class='speaker'>{escape(str(spk))}</span>"
+            f"<span class='timestamp'>{_format_hhmmss(float(time_value))}</span>"
+            "</div>"
+        )
+        for paragraph in _split_transcript_paragraphs(text.strip()):
+            html.append(f"<p>{escape(paragraph)}</p>")
+        html.append("</article>")
+
+    html.extend([
+        "</section>",
+        "</main>",
+        "</body>",
+        "</html>",
+    ])
 
     return "\n".join(html)
 
@@ -739,20 +1114,22 @@ def _build_podcast_html(job_id: str, segments: List[Dict[str, Any]]) -> str:
 # Save Outputs
 # ---------------------------------------------------------
 def save_outputs(storage, job_id: str, result: Dict[str, Any]):
-
     text = (result.get("text") or "").strip()
+    segments = _segments_from_result(result)
+    transcript_text = _build_transcript_text(segments) if segments else (text + "\n" if text else "")
 
     storage.save_output(
         job_id,
         "transcript.txt",
-        (text + "\n").encode("utf-8"),
+        transcript_text.encode("utf-8"),
         "text/plain; charset=utf-8",
     )
 
     doc = Document()
 
-    for line in text.split("\n"):
-        doc.add_paragraph(line)
+    for block in transcript_text.strip().split("\n\n") if transcript_text.strip() else []:
+        for line in block.split("\n"):
+            doc.add_paragraph(line)
 
     buf = BytesIO()
     doc.save(buf)
@@ -773,13 +1150,20 @@ def save_outputs(storage, job_id: str, result: Dict[str, Any]):
             "application/json; charset=utf-8",
         )
 
-    segments = _segments_from_result(result)
+    diarization = result.get("diarization")
+    if isinstance(diarization, dict):
+        storage.save_output(
+            job_id,
+            "diarization.json",
+            (json.dumps(diarization, indent=2) + "\n").encode("utf-8"),
+            "application/json; charset=utf-8",
+        )
 
     if segments:
 
         srt = _segments_to_srt(segments)
         vtt = _segments_to_vtt(segments)
-        html = _build_podcast_html(job_id, segments)
+        html = _build_podcast_html(job_id, segments, diarization=diarization)
 
         storage.save_output(
             job_id,

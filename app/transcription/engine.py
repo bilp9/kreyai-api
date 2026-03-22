@@ -137,6 +137,36 @@ class TranscriptionConfig:
 _MODEL: Optional[WhisperModel] = None
 
 
+def normalize_language_code(language: Optional[str]) -> Optional[str]:
+    """
+    Normalize user-facing language labels into engine-compatible codes.
+    """
+
+    if language is None:
+        return None
+
+    normalized = str(language).strip().lower()
+    if not normalized:
+        return None
+
+    ht_aliases = {
+        "ht",
+        "ht-ht",
+        "haitian creole",
+        "haitian-creole",
+        "haitian kreyol",
+        "haitian kreyòl",
+        "kreyol",
+        "kreyòl",
+        "kreyol ayisyen",
+        "kreyòl ayisyen",
+    }
+    if normalized in ht_aliases:
+        return "ht"
+
+    return normalized
+
+
 def _get_model(cfg: TranscriptionConfig) -> WhisperModel:
     global _MODEL
     if _MODEL is None:
@@ -192,8 +222,9 @@ def transcribe_audio(
     cfg = cfg or TranscriptionConfig()
 
     # Optional per-call language override (from job record)
-    if language:
-        cfg = replace(cfg, language=str(language).lower())
+    normalized_language = normalize_language_code(language)
+    if normalized_language:
+        cfg = replace(cfg, language=normalized_language)
 
     def _progress(pct: int, msg: str):
         if callable(progress_cb):
@@ -236,6 +267,28 @@ def transcribe_audio(
             continue
 
         text = seg.text.strip()
+        words_payload: List[Dict[str, Any]] = []
+
+        for word in getattr(seg, "words", None) or []:
+            word_text = getattr(word, "word", None)
+            if not word_text:
+                continue
+
+            word_start = getattr(word, "start", None)
+            word_end = getattr(word, "end", None)
+
+            words_payload.append(
+                {
+                    "word": str(word_text),
+                    "start": float(word_start) if word_start is not None else None,
+                    "end": float(word_end) if word_end is not None else None,
+                    "probability": (
+                        float(getattr(word, "probability"))
+                        if getattr(word, "probability", None) is not None
+                        else None
+                    ),
+                }
+            )
 
         raw_segments.append(
             {
@@ -252,6 +305,7 @@ def transcribe_audio(
                 "start": float(getattr(seg, "start", 0.0)),
                 "end": float(getattr(seg, "end", 0.0)),
                 "text": text,
+                "words": words_payload,
             }
         )
 
