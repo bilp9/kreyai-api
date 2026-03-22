@@ -1,14 +1,14 @@
 # =====================================
-# PUBLIC API v1 — FROZEN
+# PUBLIC API
 # =====================================
 
 import os
 import sys
-from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
+from app.config import build_openapi_yaml, get_public_api_version
 
 # -------------------------------------------------
 # Runtime guard
@@ -23,7 +23,7 @@ if sys.version_info >= (3, 13):
 # -------------------------------------------------
 app = FastAPI(
     title="KreyAI Transcription API",
-    version="1.0.0",
+    version=get_public_api_version(),
 )
 
 # =================================================
@@ -52,7 +52,7 @@ def health():
     return {
         "status": "ok",
         "service": "kreyai-api",
-        "version": "1.0.0",
+        "version": get_public_api_version(),
     }
 
 # -------------------------------------------------
@@ -89,18 +89,14 @@ app.include_router(jobs.router)
 app.include_router(upload.router)
 
 # -------------------------------------------------
-# Serve frozen OpenAPI YAML (v1)
+# Serve OpenAPI YAML
 # -------------------------------------------------
 @app.get("/openapi.yaml", include_in_schema=False)
 def openapi_yaml():
-    path = Path("docs/openapi.yaml")
-    if not path.exists():
-        raise RuntimeError("docs/openapi.yaml not found")
-
-    return FileResponse(
-        path,
+    return Response(
+        content=build_openapi_yaml(),
         media_type="application/yaml",
-        filename="openapi.yaml",
+        headers={"Content-Disposition": 'attachment; filename="openapi.yaml"'},
     )
 
 # -------------------------------------------------

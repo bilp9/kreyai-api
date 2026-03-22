@@ -354,10 +354,19 @@ def merge_chunk_results(chunk_results: List[Dict[str, Any]], chunk_durations: Li
 
     merged_segments: List[Dict[str, Any]] = []
     merged_text_parts: List[str] = []
+    merged_language = None
+    merged_detected_language = None
+    merged_requested_language = None
 
     offset = 0.0
 
     for result, duration in zip(chunk_results, chunk_durations):
+        if merged_language is None:
+            merged_language = result.get("language")
+        if merged_detected_language is None:
+            merged_detected_language = result.get("language_detected")
+        if merged_requested_language is None:
+            merged_requested_language = result.get("language_requested")
 
         chunk_text = (result.get("text") or "").strip()
         if chunk_text:
@@ -402,6 +411,9 @@ def merge_chunk_results(chunk_results: List[Dict[str, Any]], chunk_durations: Li
     return {
         "text": " ".join(merged_text_parts).strip(),
         "segments": merged_segments,
+        "language": merged_language,
+        "language_detected": merged_detected_language,
+        "language_requested": merged_requested_language,
     }
 
 
@@ -757,6 +769,8 @@ async def run_job(job_id: str):
             timeout=PROCESS_ATTEMPT_TIMEOUT_SECONDS,
         )
         transcription_time_seconds = round(time.time() - transcription_start_time, 3)
+        final_language = result.get("language") or requested_language
+        detected_language = result.get("language_detected")
 
         alignment_start_time = time.time()
         align_speakers(result, speaker_segments)
@@ -799,7 +813,9 @@ async def run_job(job_id: str):
                 "estimated_cost_usd": estimated_cost_value,
                 "realtime_factor": realtime_factor,
                 "model": "faster-whisper",
-                "language_final": requested_language,
+                "language_requested": requested_language,
+                "language_final": final_language,
+                "language_detected": detected_language,
                 "diarization_status": diarization_status,
                 "diarization_error": diarization_error_message,
                 "diarization_segments_count": len(speaker_segments),

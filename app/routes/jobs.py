@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request, Body
+from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
+from app.config import get_language_label, get_public_api_version, get_public_language_options, get_public_supported_language_codes
 from app.constants import JobStatus, JOB_ID_PREFIX
 from app.state.firestore_jobs import (
     create_job as fs_create_job,
@@ -22,6 +24,7 @@ from app.processing.dispatcher import dispatch_job
 from app.events.recorder import record_event, get_events
 from app.storage.backend import get_storage
 from app.services.email_service import send_verification_email
+from app.transcription.engine import normalize_language_code
 from app.security.job_tokens import (
     JobTokenConfig,
     mint_job_token,
@@ -33,6 +36,52 @@ from app.security.job_tokens import (
 router = APIRouter(prefix="/api", tags=["jobs"])
 
 
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_requested_language(language: str) -> str:
+    raw_language = str(language or "").strip()
+    normalized_language = normalize_language_code(raw_language)
+
+    if raw_language.lower() == "auto":
+        return "auto"
+
+    if normalized_language is None:
+        supported = ", ".join(get_public_supported_language_codes())
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Requested language is not supported in API v{get_public_api_version()}. "
+                f"Supported languages: {supported}, auto."
+            ),
+        )
+
+    if normalized_language not in get_public_supported_language_codes():
+        supported = ", ".join(get_public_supported_language_codes())
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Requested language is not supported in API v{get_public_api_version()}. "
+                f"Supported languages: {supported}, auto."
+            ),
+        )
+
+    return normalized_language
+
+
+@router.get("/public-config")
+def get_public_config():
+    return {
+        "api_version": get_public_api_version(),
+        "languages": [
+            {"code": code, "label": get_language_label(code)}
+            for code in get_public_language_options()
+        ],
+        "default_language": "auto",
+    }
+
+
 # -------------------------------------------------
 # Token Helpers
 # -------------------------------------------------
@@ -40,6 +89,11 @@ router = APIRouter(prefix="/api", tags=["jobs"])
 def _token_cfg() -> JobTokenConfig:
     secret = os.getenv("JOB_TOKEN_SECRET", "")
     ttl = int(os.getenv("JOB_TOKEN_TTL_SECONDS", str(7 * 24 * 3600)))
+    if len(secret) < 16:
+        raise HTTPException(
+            status_code=503,
+            detail="Job access tokens are not configured.",
+        )
     return JobTokenConfig(secret=secret, ttl_seconds=ttl)
 
 
@@ -62,10 +116,15 @@ def _require_token(request: Request, job_id: str) -> None:
 
 @router.post("/")
 async def create_job_route(
+    background_tasks: BackgroundTasks,
+    response: Response,
     email: str = Body(...),
     language: str = Body("auto"),
     accepted_terms: bool = Body(False),
 ):
+    started_at = time.perf_counter()
+    language = _normalize_requested_language(language)
+
     if not accepted_terms:
         raise HTTPException(
             status_code=400,
@@ -80,18 +139,28 @@ async def create_job_route(
         "email": email,
         "language": language,
         "accepted_terms": True,
-        "terms_accepted_at": datetime.utcnow().isoformat(),
+        "terms_accepted_at": _utcnow_iso(),
         "verification_code": code,
         "verified": False,
         "status": JobStatus.PENDING_VERIFICATION,
-        "created_at": datetime.utcnow().isoformat(),
-        "updated_at": datetime.utcnow().isoformat(),
+        "created_at": _utcnow_iso(),
+        "updated_at": _utcnow_iso(),
         "progress": 0,
     }
 
-    fs_create_job(job)
-    record_event(job_id, "job_created", "Awaiting verification", JobStatus.PENDING_VERIFICATION)
-    asyncio.create_task(send_verification_email(email, job_id, code))
+    await asyncio.to_thread(fs_create_job, job)
+    background_tasks.add_task(
+        record_event,
+        job_id,
+        "job_created",
+        "Awaiting verification",
+        JobStatus.PENDING_VERIFICATION,
+    )
+    background_tasks.add_task(send_verification_email, email, job_id, code)
+
+    response.headers["Server-Timing"] = (
+        f"create_job;dur={(time.perf_counter() - started_at) * 1000:.1f}"
+    )
 
     return {
         "job_id": job_id,
@@ -118,7 +187,7 @@ def verify_job_route(job_id: str, code: str):
         {
             "verified": True,
             "status": JobStatus.VERIFIED,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": _utcnow_iso(),
         },
     )
 
@@ -190,7 +259,7 @@ def finalize_upload(
             "size_bytes": payload.size_bytes,
             "content_type": payload.content_type,
             "status": JobStatus.QUEUED,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": _utcnow_iso(),
         },
     )
 

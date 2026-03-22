@@ -1,6 +1,6 @@
 #=====================================
-# PUBLIC API v1 — FROZEN
-# Do not change without version bump
+# PUBLIC API
+# Mirror of the default runtime /openapi.yaml output.
 #======================================
 
 openapi: 3.0.3
@@ -8,10 +8,9 @@ openapi: 3.0.3
 info:
   title: KreyAI Transcription API
   description: >
-    KreyAI v1 public transcription API.
-    Supports English, Spanish, French, and Portuguese.
-    Other languages may be processed internally but are not publicly exposed in v1.
-  version: "1.0.0"
+    KreyAI public transcription API.
+    Publicly supported languages in the default deployment: en, es, fr, pt, ht.
+  version: "2.0.0"
   contact:
     name: KreyAI
     url: https://www.kreyai.com
@@ -46,7 +45,7 @@ paths:
                 language:
                   type: string
                   description: Language code or auto-detect
-                  enum: [auto, en, es, fr, pt]
+                  enum: [auto, en, es, fr, pt, ht]
                   default: auto
                 format:
                   type: string
@@ -62,45 +61,16 @@ paths:
       responses:
         "200":
           description: Transcription completed
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/TranscriptionResult"
-
         "400":
           description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
         "401":
           description: Invalid or missing API key
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
         "413":
           description: File too large
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
         "429":
           description: Quota exceeded
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
         "500":
           description: Processing failed
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
 
 components:
   securitySchemes:
@@ -108,68 +78,3 @@ components:
       type: http
       scheme: bearer
       bearerFormat: API_KEY
-
-  schemas:
-    TranscriptionResult:
-      type: object
-      properties:
-        id:
-          type: string
-          example: kr_trx_9f82c1a
-        status:
-          type: string
-          enum: [completed]
-        language:
-          type: string
-          example: en
-        speakers_detected:
-          type: integer
-          example: 2
-        output:
-          type: object
-          properties:
-            text:
-              type: string
-              example: "Hello everyone, thank you for joining today..."
-            segments:
-              type: array
-              items:
-                $ref: "#/components/schemas/Segment"
-        usage:
-          type: object
-          properties:
-            file_size_mb:
-              type: number
-              example: 12.4
-        created_at:
-          type: string
-          format: date-time
-
-    Segment:
-      type: object
-      properties:
-        start:
-          type: number
-          example: 0.0
-        end:
-          type: number
-          example: 4.2
-        speaker:
-          type: string
-          example: S1
-        text:
-          type: string
-          example: "Hello everyone"
-
-    Error:
-      type: object
-      properties:
-        error:
-          type: object
-          properties:
-            code:
-              type: string
-              example: unsupported_language
-            message:
-              type: string
-              example: "Requested language is not supported in v1."

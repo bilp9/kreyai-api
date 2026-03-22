@@ -1,29 +1,11 @@
+# KreyAI API Python Notes
 
----
+Python examples for the current public deployment are pending refresh.
 
-# 📄 `docs/api/python.md`
+For now:
 
-```md
-# KreyAI API v1 — Python Usage
+- Use the live schema at `https://api.kreyai.com/openapi.yaml`
+- Follow the email-verified job flow exposed under `/api/...`
+- Treat the checked-in `kreyai-python` package as a legacy draft client, not the current v2 reference
 
-> This is client-side example code.
-> You do not run this inside KreyAI’s backend.
-
----
-
-## Install (future SDK)
-
-```bash
-pip install kreyai
-
-from kreyai import Client
-
-client = Client(api_key="YOUR_API_KEY")
-
-result = client.transcribe(
-    file_path="audio.mp3",
-    language="auto",
-    format="text"
-)
-
-print(result.text)
+Once the Python client is refreshed for the current API shape, this file should be replaced with real working examples.

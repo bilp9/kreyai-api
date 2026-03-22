@@ -1,20 +1,20 @@
 # app/transcription/engine.py
 
 # =================================================
-# KreyAI Transcription Engine — API v1 (FROZEN)
-# Any breaking change requires v2
+# KreyAI Transcription Engine
 # =================================================
 
 from __future__ import annotations
 
 import os
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Optional, List, Dict, Any
 from collections import deque
 from pathlib import Path
 
 from faster_whisper import WhisperModel
+from app.config import get_default_whisper_model_size
 
 # -------------------------------------------------
 # Akademi
@@ -108,7 +108,7 @@ WINDOW_FULL_A3 = 0.35
 # -------------------------------------------------
 @dataclass(frozen=True)
 class TranscriptionConfig:
-    model_size: str = "medium"
+    model_size: str = field(default_factory=get_default_whisper_model_size)
     device: str = "cpu"
     compute_type: str = "int8"
 
@@ -149,6 +149,9 @@ def normalize_language_code(language: Optional[str]) -> Optional[str]:
     if not normalized:
         return None
 
+    if normalized == "auto":
+        return None
+
     ht_aliases = {
         "ht",
         "ht-ht",
@@ -170,7 +173,7 @@ def normalize_language_code(language: Optional[str]) -> Optional[str]:
 def _get_model(cfg: TranscriptionConfig) -> WhisperModel:
     global _MODEL
     if _MODEL is None:
-        model_path = os.getenv("WHISPER_MODEL_PATH", cfg.model_size)
+        model_path = os.getenv("WHISPER_MODEL_PATH") or os.getenv("WHISPER_MODEL_SIZE") or cfg.model_size
         _MODEL = WhisperModel(
             model_path,
             device=cfg.device,
@@ -225,6 +228,7 @@ def transcribe_audio(
     normalized_language = normalize_language_code(language)
     if normalized_language:
         cfg = replace(cfg, language=normalized_language)
+    engine_language = normalized_language or None
 
     def _progress(pct: int, msg: str):
         if callable(progress_cb):
@@ -242,9 +246,9 @@ def transcribe_audio(
 
     _progress(20, "Transcribing audio")
 
-    segments_iter, _info = model.transcribe(
+    segments_iter, info = model.transcribe(
         audio_path,
-        language=cfg.language,
+        language=engine_language,
         task="transcribe", #enforcing transcription over translation 
         beam_size=cfg.beam_size,
         temperature=cfg.temperature,
@@ -309,14 +313,25 @@ def transcribe_audio(
             }
         )
 
+    detected_language = normalize_language_code(getattr(info, "language", None))
+    effective_language = detected_language or normalized_language or cfg.language
+    is_ht_run = effective_language == "ht"
+
     if not raw_segments:
         _progress(100, "No speech detected")
-        return {"text": "", "segments": [], "debug": None}
+        return {
+            "text": "",
+            "segments": [],
+            "language": effective_language,
+            "language_requested": normalized_language or "auto",
+            "language_detected": detected_language,
+            "debug": None,
+        }
 
     # =================================================
     # NON-HT: minimal post-processing
     # =================================================
-    if cfg.language != "ht":
+    if not is_ht_run:
         _progress(75, "Basic formatting")
         joined = " ".join(seg["text"] for seg in raw_segments)
         final_text = apply_formatting(joined).strip()
@@ -325,7 +340,14 @@ def transcribe_audio(
             segments_list[i]["text"] = raw_segments[i]["text"]
 
         _progress(100, "Done")
-        return {"text": final_text, "segments": segments_list, "debug": None}
+        return {
+            "text": final_text,
+            "segments": segments_list,
+            "language": effective_language,
+            "language_requested": normalized_language or "auto",
+            "language_detected": detected_language,
+            "debug": None,
+        }
 
     # =================================================
     # HT: Full KreyAI enhancement pipeline
@@ -439,9 +461,14 @@ def transcribe_audio(
     return {
         "text": final_text,
         "segments": segments_list,
+        "language": effective_language,
+        "language_requested": normalized_language or "auto",
+        "language_detected": detected_language,
         "debug": (
             {
-                "language": cfg.language,
+                "language": effective_language,
+                "language_requested": normalized_language or "auto",
+                "language_detected": detected_language,
                 "speaker_ht_density": speaker_ht_density,
                 "speaker_mode": speaker_mode,
                 "a3_events_total": len(a3_events),

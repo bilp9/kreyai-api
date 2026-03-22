@@ -1,28 +1,11 @@
+# KreyAI API JavaScript Notes
 
----
+JavaScript examples for the current public deployment are pending refresh.
 
-# 📄 `docs/api/javascript.md`
+For now:
 
-```md
-# KreyAI API v1 — JavaScript (Node.js)
+- Use the live schema at `https://api.kreyai.com/openapi.yaml`
+- Follow the email-verified job flow exposed under `/api/...`
+- Treat older direct-transcribe examples as outdated unless they are regenerated from the current runtime schema
 
----
-
-## Install (future SDK)
-
-```bash
-npm install kreyai
-
-import { KreyAI } from "kreyai";
-
-const client = new KreyAI({
-  apiKey: process.env.KREYAI_API_KEY
-});
-
-const result = await client.transcribe({
-  file: "./audio.mp3",
-  language: "auto",
-  format: "text"
-});
-
-console.log(result.text);
+Once the JavaScript client examples are refreshed for the current API shape, this file should be replaced with working snippets.
