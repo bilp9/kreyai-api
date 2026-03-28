@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 import uuid
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Deque, Dict, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Request, Response
@@ -15,10 +16,11 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from app.config import get_language_label, get_public_api_version, get_public_language_options, get_public_supported_language_codes
-from app.constants import JobStatus, JOB_ID_PREFIX
+from app.constants import JobStatus, JOB_ID_PREFIX, SpeakerMode
 from app.constants import (
     PUBLIC_CREATE_JOB_RATE_LIMIT,
     PUBLIC_RATE_LIMIT_WINDOW_SECONDS,
+    VERIFICATION_CODE_TTL_MINUTES,
     PUBLIC_VERIFY_RATE_LIMIT,
     VERIFICATION_LOCKOUT_SECONDS,
     VERIFICATION_MAX_ATTEMPTS,
@@ -29,8 +31,10 @@ from app.state.firestore_jobs import (
     update_job as fs_update_job,
 )
 from app.processing.dispatcher import dispatch_job
+from app.processing.routing import resolve_processing_route
 from app.events.recorder import record_event, get_events
 from app.storage.backend import get_storage
+from app.services.access_control import resolve_submission_access, serialize_access_decision
 from app.services.email_service import send_verification_email
 from app.transcription.engine import normalize_language_code
 from app.security.job_tokens import (
@@ -43,6 +47,7 @@ from app.security.job_tokens import (
 
 router = APIRouter(prefix="/api", tags=["jobs"])
 _PUBLIC_RATE_LIMITS: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _utcnow_iso() -> str:
@@ -51,6 +56,12 @@ def _utcnow_iso() -> str:
 
 def _utcnow_ts() -> float:
     return datetime.now(timezone.utc).timestamp()
+
+
+def _verification_expiry_iso() -> str:
+    return (
+        datetime.now(timezone.utc) + timedelta(minutes=VERIFICATION_CODE_TTL_MINUTES)
+    ).isoformat()
 
 
 def _client_ip(request: Request) -> str:
@@ -110,6 +121,16 @@ def _normalize_requested_language(language: str) -> str:
     return normalized_language
 
 
+def _normalize_email(email: str) -> str:
+    normalized = str(email or "").strip().lower()
+    if not normalized or not _EMAIL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter a valid email address.",
+        )
+    return normalized
+
+
 @router.get("/public-config")
 def get_public_config():
     return {
@@ -150,6 +171,26 @@ def _require_token(request: Request, job_id: str) -> None:
         raise HTTPException(status_code=401, detail="Invalid access token.")
 
 
+def _validate_upload_path(job_id: str, file_path: str) -> str:
+    normalized_path = str(file_path or "").strip()
+    expected_prefix = f"jobs/{job_id}/uploads/"
+
+    if not normalized_path.startswith(expected_prefix):
+        raise HTTPException(
+            status_code=400,
+            detail="Upload path does not belong to this job.",
+        )
+
+    storage = get_storage()
+    if not storage.blob_exists(normalized_path):
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file could not be found. Please upload again.",
+        )
+
+    return normalized_path
+
+
 # -------------------------------------------------
 # 1️⃣ Create Job
 # -------------------------------------------------
@@ -169,7 +210,9 @@ async def create_job_route(
         limit=PUBLIC_CREATE_JOB_RATE_LIMIT,
     )
     started_at = time.perf_counter()
+    email = _normalize_email(email)
     language = _normalize_requested_language(language)
+    access_decision = resolve_submission_access(email)
 
     if not accepted_terms:
         raise HTTPException(
@@ -187,11 +230,13 @@ async def create_job_route(
         "accepted_terms": True,
         "terms_accepted_at": _utcnow_iso(),
         "verification_code": code,
+        "verification_expires_at": _verification_expiry_iso(),
         "verified": False,
         "status": JobStatus.PENDING_VERIFICATION,
         "created_at": _utcnow_iso(),
         "updated_at": _utcnow_iso(),
         "progress": 0,
+        "access_decision": serialize_access_decision(access_decision),
     }
 
     await asyncio.to_thread(fs_create_job, job)
@@ -234,6 +279,26 @@ def verify_job_route(job_id: str, code: str, request: Request):
         raise HTTPException(400, "Job already verified")
 
     now_ts = _utcnow_ts()
+    verification_expires_at = job.get("verification_expires_at")
+    if verification_expires_at:
+        try:
+            expires_ts = datetime.fromisoformat(str(verification_expires_at)).timestamp()
+        except ValueError:
+            expires_ts = 0.0
+        if expires_ts <= now_ts:
+            fs_update_job(
+                job_id,
+                {
+                    "status": JobStatus.EXPIRED,
+                    "status_message": "Verification code expired",
+                    "updated_at": _utcnow_iso(),
+                },
+            )
+            raise HTTPException(
+                status_code=410,
+                detail="Verification code expired. Please start again.",
+            )
+
     locked_until = float(job.get("verification_locked_until") or 0.0)
     if locked_until > now_ts:
         raise HTTPException(
@@ -259,6 +324,7 @@ def verify_job_route(job_id: str, code: str, request: Request):
             "status": JobStatus.VERIFIED,
             "verification_attempts": 0,
             "verification_locked_until": None,
+            "verification_code": None,
             "verified_at": _utcnow_iso(),
             "updated_at": _utcnow_iso(),
         },
@@ -311,6 +377,7 @@ class FinalizeUploadRequest(BaseModel):
     file_path: str
     size_bytes: int
     content_type: str
+    speaker_mode: str = SpeakerMode.UNSURE.value
 
 
 @router.post("/jobs/{job_id}/finalize-upload")
@@ -325,20 +392,67 @@ def finalize_upload(
     if not job:
         raise HTTPException(404, "Job not found")
 
+    file_path = _validate_upload_path(job_id, payload.file_path)
+    access_decision = resolve_submission_access(str(job.get("email") or ""))
+    route = resolve_processing_route(payload.speaker_mode)
+
+    if not access_decision.allowed:
+        fs_update_job(
+            job_id,
+            {
+                "status": JobStatus.VERIFIED,
+                "status_message": "Payment is required before this job can be processed.",
+                "access_decision": serialize_access_decision(access_decision),
+                "updated_at": _utcnow_iso(),
+            },
+        )
+        raise HTTPException(
+            status_code=402,
+            detail="Payment is required before this job can be processed.",
+        )
+
     fs_update_job(
         job_id,
         {
-            "file_path": payload.file_path,
+            "file_path": file_path,
             "size_bytes": payload.size_bytes,
             "content_type": payload.content_type,
+            **route,
             "status": JobStatus.QUEUED,
+            "status_message": (
+                "Your file has been uploaded successfully. Premium speaker labeling will begin shortly."
+                if route["requires_diarization"]
+                else "Your file has been uploaded successfully. Standard transcription will begin shortly."
+            ),
+            "access_decision": serialize_access_decision(access_decision),
             "updated_at": _utcnow_iso(),
         },
     )
 
     record_event(job_id, "uploaded", "Cloud upload completed", JobStatus.QUEUED)
 
-    dispatch_job(job_id)
+    try:
+        dispatch_job(
+            job_id,
+            worker_job_name=str(route["worker_job_name"]),
+            worker_job_region=str(route["worker_job_region"]),
+            execution_lane=str(route["execution_lane"]),
+            requires_diarization=bool(route["requires_diarization"]),
+        )
+    except Exception as exc:
+        fs_update_job(
+            job_id,
+            {
+                "status": JobStatus.VERIFIED,
+                "status_message": "Upload received but processing could not be started. Please retry.",
+                "dispatch_error": str(exc),
+                "updated_at": _utcnow_iso(),
+            },
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Upload received, but processing could not be started. Please try again.",
+        ) from exc
 
     return {"message": "Upload finalized and job queued"}
 

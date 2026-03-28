@@ -56,6 +56,7 @@ from app.transcription.promotion import (
     record_reversal,
 )
 from app.transcription.reversal import A3Event, detect_a3_reversals
+from app.transcription.eval_artifacts import write_eval_artifact
 
 
 # -------------------------------------------------
@@ -82,15 +83,10 @@ def _load_akademi() -> Optional[AkademiNormalizer]:
 # -------------------------------------------------
 # Decoder prompt (HT-first)
 # -------------------------------------------------
-HT_DECODING_PROMPT = """
-You are transcribing spoken Haitian Creole (Kreyòl Ayisyen).
-
-Rules:
-- Do NOT translate.
-- Preserve code-switching (French / English).
-- Do NOT invent words.
-- Prefer standard Haitian Creole orthography when applicable.
-"""
+# Disabled by default because long instruction-style prompts can leak
+# into the transcript itself on lower-confidence runs. If we want to
+# experiment with prompting again, keep it short and bias-only.
+HT_DECODING_PROMPT = "Kreyol Ayisyen, pa tradui, kenbe mo angle ak franse yo."
 
 
 # -------------------------------------------------
@@ -135,6 +131,57 @@ class TranscriptionConfig:
 # Whisper model singleton
 # -------------------------------------------------
 _MODEL: Optional[WhisperModel] = None
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _promotion_writes_enabled(explicit: Optional[bool] = None) -> bool:
+    if explicit is not None:
+        return explicit
+    return _bool_env("KREYAI_HT_EVAL_WRITES", default=False)
+
+
+def _ht_decoder_prompt() -> Optional[str]:
+    if not _bool_env("KREYAI_HT_USE_DECODER_PROMPT", default=False):
+        return None
+    prompt = os.getenv("KREYAI_HT_DECODER_PROMPT", "").strip()
+    if prompt:
+        return prompt
+    return HT_DECODING_PROMPT
+
+
+def _eval_dataset_id() -> Optional[str]:
+    value = os.getenv("KREYAI_HT_EVAL_DATASET", "").strip()
+    return value or None
+
+
+def _eval_run_label(audio_path: str) -> str:
+    env_value = os.getenv("KREYAI_HT_EVAL_RUN_LABEL", "").strip()
+    if env_value:
+        return env_value
+    return Path(audio_path).stem or "eval-run"
+
+
+def _load_eval_gold_text(audio_path: str) -> Optional[str]:
+    explicit_path = os.getenv("KREYAI_HT_EVAL_GOLD_PATH", "").strip()
+    if explicit_path:
+        path = Path(explicit_path)
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+
+    gold_dir = os.getenv("KREYAI_HT_EVAL_GOLD_DIR", "").strip()
+    if not gold_dir:
+        return None
+
+    path = Path(gold_dir) / f"{Path(audio_path).stem}.txt"
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
 
 
 def normalize_language_code(language: Optional[str]) -> Optional[str]:
@@ -209,6 +256,7 @@ def transcribe_audio(
     *,
     language: Optional[str] = None,
     debug: bool = False,
+    allow_promotion_writes: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Returns:
@@ -223,6 +271,7 @@ def transcribe_audio(
     """
 
     cfg = cfg or TranscriptionConfig()
+    promotion_writes_enabled = _promotion_writes_enabled(allow_promotion_writes)
 
     # Optional per-call language override (from job record)
     normalized_language = normalize_language_code(language)
@@ -254,7 +303,7 @@ def transcribe_audio(
         temperature=cfg.temperature,
         vad_filter=cfg.vad_filter,
         condition_on_previous_text=cfg.condition_on_previous_text,
-        initial_prompt=HT_DECODING_PROMPT if cfg.language == "ht" else None,
+        initial_prompt=_ht_decoder_prompt() if cfg.language == "ht" else None,
         no_speech_threshold=cfg.no_speech_threshold,
         log_prob_threshold=cfg.log_prob_threshold,
         compression_ratio_threshold=cfg.compression_ratio_threshold,
@@ -312,6 +361,17 @@ def transcribe_audio(
                 "words": words_payload,
             }
         )
+
+    raw_segments_snapshot = [
+        {
+            "segment_index": seg["segment_index"],
+            "raw_text": seg["raw_text"],
+            "text": seg["text"],
+            "avg_logprob": seg["avg_logprob"],
+            "hallucinated": seg["hallucinated"],
+        }
+        for seg in raw_segments
+    ]
 
     detected_language = normalize_language_code(getattr(info, "language", None))
     effective_language = detected_language or normalized_language or cfg.language
@@ -399,7 +459,7 @@ def transcribe_audio(
     _progress(75, "A3 window corrections")
     window = deque(maxlen=cfg.a3_window_segments)
     a3_events: List[A3Event] = []
-    promo_db = load_promotion_db()
+    promo_db = load_promotion_db() if promotion_writes_enabled else None
 
     for seg in raw_segments:
         window.append(seg["text"])
@@ -435,9 +495,11 @@ def transcribe_audio(
                     segment_id=str(seg["segment_index"]),
                 )
                 a3_events.append(ev)
-                record_fire(promo_db, rule_id=rule_id, mode=a3_mode)
+                if promo_db is not None:
+                    record_fire(promo_db, rule_id=rule_id, mode=a3_mode)
 
-    save_promotion_db(promo_db)
+    if promo_db is not None:
+        save_promotion_db(promo_db)
 
     _progress(88, "Formatting output")
     joined = " ".join(seg["text"] for seg in raw_segments)
@@ -450,7 +512,7 @@ def transcribe_audio(
 
     # A3 reversal detection
     reversed_events = detect_a3_reversals(a3_events=a3_events, final_text=final_text)
-    if reversed_events:
+    if reversed_events and promotion_writes_enabled:
         dbp = load_promotion_db()
         for ev in reversed_events:
             record_reversal(dbp, rule_id=ev.rule_id)
@@ -458,24 +520,60 @@ def transcribe_audio(
 
     _progress(100, "Done")
 
+    debug_payload = (
+        {
+            "language": effective_language,
+            "language_requested": normalized_language or "auto",
+            "language_detected": detected_language,
+            "speaker_ht_density": speaker_ht_density,
+            "speaker_mode": speaker_mode,
+            "promotion_writes_enabled": promotion_writes_enabled,
+            "a3_events_total": len(a3_events),
+            "a3_reversals_total": len(reversed_events),
+            "pipeline_metrics": metrics.snapshot(),
+        }
+        if debug
+        else None
+    )
+
+    eval_artifact_path: Optional[str] = None
+
+    if promotion_writes_enabled:
+        try:
+            artifact_path = write_eval_artifact(
+                audio_path=audio_path,
+                language_requested=normalized_language or "auto",
+                language_detected=detected_language,
+                language_final=effective_language,
+                raw_segments=raw_segments_snapshot,
+                cleaned_segments=[
+                    {
+                        "segment_index": seg["segment_index"],
+                        "text": seg["text"],
+                        "ht_density_raw": seg.get("ht_density_raw"),
+                        "low_confidence": seg.get("low_confidence"),
+                    }
+                    for seg in raw_segments
+                ],
+                final_text=final_text,
+                debug_payload=debug_payload,
+                gold_text=_load_eval_gold_text(audio_path),
+                dataset_id=_eval_dataset_id(),
+                run_label=_eval_run_label(audio_path),
+                approved_for_improvement=promotion_writes_enabled,
+            )
+            eval_artifact_path = str(artifact_path)
+        except Exception:
+            pass
+
+    if debug_payload is not None:
+        debug_payload["eval_artifact_path"] = eval_artifact_path
+
     return {
         "text": final_text,
         "segments": segments_list,
         "language": effective_language,
         "language_requested": normalized_language or "auto",
         "language_detected": detected_language,
-        "debug": (
-            {
-                "language": effective_language,
-                "language_requested": normalized_language or "auto",
-                "language_detected": detected_language,
-                "speaker_ht_density": speaker_ht_density,
-                "speaker_mode": speaker_mode,
-                "a3_events_total": len(a3_events),
-                "a3_reversals_total": len(reversed_events),
-                "pipeline_metrics": metrics.snapshot(),
-            }
-            if debug
-            else None
-        ),
+        "debug": debug_payload,
     }

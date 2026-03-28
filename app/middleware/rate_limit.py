@@ -1,7 +1,7 @@
 # app/middleware/rate_limit.py
 # =====================================
 # RATE LIMIT + QUOTA MIDDLEWARE
-# API v1 — CLOUD RUN SAFE
+# CLOUD RUN SAFE
 # =====================================
 
 from datetime import datetime, timedelta, timezone

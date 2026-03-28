@@ -3,6 +3,8 @@
 import os
 import httpx
 
+from app.constants import VERIFICATION_CODE_TTL_MINUTES
+
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000")
 FROM_EMAIL = "KreyAI <noreply@kreyai.com>"
@@ -68,6 +70,10 @@ async def send_verification_email(to_email: str, job_id: str, code: str):
       <p>Or enter this verification code manually:</p>
       <p style="font-size:22px; font-weight:600; letter-spacing:3px;">
         {code}
+      </p>
+
+      <p style="font-size:13px; color:#777;">
+        This code is valid for {VERIFICATION_CODE_TTL_MINUTES} minutes.
       </p>
 
       <p style="font-size:13px; color:#777;">

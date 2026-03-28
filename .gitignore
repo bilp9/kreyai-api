@@ -19,4 +19,5 @@ app/storage/*.m4a
 app/storage/*.mp3
 app/storage/*.mp4
 app/storage/*.MOV
+app/storage/evals/
 app/storage/uploads/cors.json

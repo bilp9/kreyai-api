@@ -31,6 +31,12 @@ class JobStatus(str, Enum):
     EXPIRED = "expired"
 
 
+class SpeakerMode(str, Enum):
+    SINGLE = "single"
+    MULTI = "multi"
+    UNSURE = "unsure"
+
+
 # =========================
 # File & Upload Limits
 # =========================

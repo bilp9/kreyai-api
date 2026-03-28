@@ -1,5 +1,5 @@
 # =====================================
-# FINAL TRANSCRIPT FORMATTING — v1
+# FINAL TRANSCRIPT FORMATTING
 # Linguistic + Structural formatting
 # =====================================
 

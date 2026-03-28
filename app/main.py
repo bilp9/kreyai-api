@@ -83,9 +83,10 @@ app.add_middleware(JobAccessMiddleware)
 # -------------------------------------------------
 # Routes
 # -------------------------------------------------
-from app.routes import jobs, upload
+from app.routes import jobs, ops, upload
 
 app.include_router(jobs.router)
+app.include_router(ops.router)
 app.include_router(upload.router)
 
 # -------------------------------------------------

@@ -1,7 +1,18 @@
-from fastapi import Request, HTTPException, status
+from fastapi import Request, HTTPException
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.models.user import get_user_by_api_key
+from app.auth.auth import authenticate_api_key, extract_api_key
+
+
+def _is_public_path(path: str) -> bool:
+    return (
+        path == "/"
+        or path.startswith("/health")
+        or path.startswith("/docs")
+        or path.startswith("/openapi")
+        or path.startswith("/api")
+    )
 
 
 class APIKeyAuthMiddleware(BaseHTTPMiddleware):
@@ -15,35 +26,23 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
 
         path = request.url.path
 
-        # ----------------------------------------
-        # ✅ PUBLIC ROUTES (NO API KEY REQUIRED)
-        # ----------------------------------------
-        if (
-            path == "/"                              # Allow base URL
-            or path.startswith("/health")
-            or path.startswith("/docs")
-            or path.startswith("/openapi")
-            or path.startswith("/api")               # Allow ALL public SaaS API
-        ):
+        if _is_public_path(path):
             return await call_next(request)
 
         # ----------------------------------------
         # 🔐 EVERYTHING ELSE REQUIRES API KEY
         # ----------------------------------------
-        api_key = request.headers.get("X-API-Key")
-
-        if not api_key:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing API key",
+        try:
+            user = authenticate_api_key(
+                extract_api_key(
+                    authorization=request.headers.get("Authorization"),
+                    x_api_key=request.headers.get("X-API-Key"),
+                )
             )
-
-        user = get_user_by_api_key(api_key)
-
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid API key",
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
             )
 
         # Attach user to request state

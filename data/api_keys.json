@@ -2,5 +2,10 @@
   "krey_live_9f83a2d1a4b5c6d7": {
     "email": "you@example.com",
     "plan": "soft-launch"
+  },
+  "krey_ops_live_20260324_73e33455": {
+    "email": "billy@kreyai.com",
+    "plan": "internal-ops",
+    "active": true
   }
 }

@@ -105,6 +105,9 @@ class GCSStorage:
         blob.download_to_filename(local_path)
         return local_path
 
+    def blob_exists(self, blob_path: str) -> bool:
+        return self.bucket.blob(blob_path).exists()
+
     # -------------------------------------------------
     # SAVE OUTPUT
     # -------------------------------------------------

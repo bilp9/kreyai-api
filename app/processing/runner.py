@@ -22,6 +22,7 @@ from app.constants import (
 )
 
 from app.transcription.engine import transcribe_audio, normalize_language_code
+from app.transcription.formatting import apply_formatting
 from app.transcription.diarization import (
     diarize_audio,
     get_diarization_configuration_error,
@@ -43,6 +44,7 @@ JOBS_COL = "jobs"
 # ---------------------------------------------------------
 CHUNK_IF_LONGER_THAN_SECONDS = 600  # 10 minutes
 CHUNK_SIZE_SECONDS = 300            # 5 minutes
+PARAGRAPH_BREAK_THRESHOLD = 1.2
 
 
 # ---------------------------------------------------------
@@ -94,6 +96,43 @@ def claim_one_queued_job() -> Optional[str]:
         if _txn_claim(db.transaction()):
             print(f"Claimed job {job_id}")
             return job_id
+
+    return None
+
+
+def claim_specific_queued_job(job_id: str) -> Optional[str]:
+
+    jobs_ref = db.collection(JOBS_COL)
+    doc_ref = jobs_ref.document(job_id)
+
+    @firestore.transactional
+    def _txn_claim(txn: firestore.Transaction) -> bool:
+
+        snap = doc_ref.get(transaction=txn)
+
+        if not snap.exists:
+            return False
+
+        cur = snap.to_dict() or {}
+
+        if cur.get("status") != JobStatus.QUEUED.value:
+            return False
+
+        txn.update(
+            doc_ref,
+            {
+                "status": JobStatus.PROCESSING.value,
+                "progress": int(cur.get("progress") or 0),
+                "status_message": "Claimed by worker",
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+        )
+
+        return True
+
+    if _txn_claim(db.transaction()):
+        print(f"Claimed requested job {job_id}")
+        return job_id
 
     return None
 
@@ -247,6 +286,55 @@ def _build_transcript_text(segments: List[Dict[str, Any]]) -> str:
         lines.append("")
 
     return "\n".join(lines).strip() + "\n" if lines else ""
+
+
+def _has_speaker_labels(segments: List[Dict[str, Any]]) -> bool:
+    return any((seg.get("speaker") or "").strip() for seg in segments)
+
+
+def _build_plain_paragraph_transcript(
+    segments: List[Dict[str, Any]],
+    *,
+    paragraph_break_threshold: float = PARAGRAPH_BREAK_THRESHOLD,
+) -> str:
+
+    paragraphs: List[str] = []
+    current_paragraph: List[str] = []
+    last_end: Optional[float] = None
+
+    for seg in segments:
+        text = " ".join(str(seg.get("text") or "").split()).strip()
+        start = seg.get("start")
+        end = seg.get("end")
+
+        if not text:
+            continue
+
+        start_value = float(start) if start is not None else None
+        end_value = float(end) if end is not None else None
+
+        if (
+            current_paragraph
+            and last_end is not None
+            and start_value is not None
+            and (start_value - last_end) > paragraph_break_threshold
+        ):
+            paragraph_text = apply_formatting(" ".join(current_paragraph)).strip()
+            if paragraph_text:
+                paragraphs.append(paragraph_text)
+            current_paragraph = [text]
+        else:
+            current_paragraph.append(text)
+
+        if end_value is not None:
+            last_end = end_value
+
+    if current_paragraph:
+        paragraph_text = apply_formatting(" ".join(current_paragraph)).strip()
+        if paragraph_text:
+            paragraphs.append(paragraph_text)
+
+    return "\n\n".join(paragraphs).strip() + "\n" if paragraphs else ""
 
 
 # ---------------------------------------------------------
@@ -417,7 +505,19 @@ def merge_chunk_results(chunk_results: List[Dict[str, Any]], chunk_durations: Li
     }
 
 
-async def transcribe_with_optional_chunking(file_path: str, language: str) -> Dict[str, Any]:
+async def transcribe_with_optional_chunking(
+    file_path: str,
+    language: str,
+    *,
+    progress_cb=None,
+) -> Dict[str, Any]:
+
+    def emit_progress(pct: int, message: str) -> None:
+        if callable(progress_cb):
+            try:
+                progress_cb(int(pct), str(message))
+            except Exception:
+                pass
 
     total_duration = get_audio_duration_seconds(file_path)
 
@@ -426,6 +526,7 @@ async def transcribe_with_optional_chunking(file_path: str, language: str) -> Di
             transcribe_audio,
             file_path,
             language=language,
+            progress_cb=progress_cb,
         )
 
     print(
@@ -440,15 +541,28 @@ async def transcribe_with_optional_chunking(file_path: str, language: str) -> Di
         chunk_results: List[Dict[str, Any]] = []
         chunk_durations: List[float] = []
 
-        for chunk_path in chunk_paths:
+        total_chunks = max(1, len(chunk_paths))
+
+        for index, chunk_path in enumerate(chunk_paths):
 
             duration = get_audio_duration_seconds(chunk_path)
             chunk_durations.append(duration)
+
+            chunk_start = int((index / total_chunks) * 100)
+            chunk_end = int(((index + 1) / total_chunks) * 100)
+
+            def chunk_progress(pct: int, message: str) -> None:
+                scaled_pct = chunk_start + int((max(0, min(100, pct)) / 100) * (chunk_end - chunk_start))
+                emit_progress(
+                    scaled_pct,
+                    f"Transcribing chunk {index + 1}/{total_chunks}: {message}",
+                )
 
             result = await asyncio.to_thread(
                 transcribe_audio,
                 chunk_path,
                 language=language,
+                progress_cb=chunk_progress,
             )
 
             chunk_results.append(result)
@@ -654,6 +768,19 @@ async def run_job(job_id: str):
         return
 
     job = snap.to_dict() or {}
+    progress = int(job.get("progress") or 0)
+
+    def update_progress(next_progress: int, message: str) -> None:
+        nonlocal progress
+        progress = max(progress, int(next_progress))
+        doc_ref.update(
+            {
+                "status": JobStatus.PROCESSING.value,
+                "progress": progress,
+                "status_message": message,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        )
 
     attempts = int(job.get("attempts") or 0)
 
@@ -673,10 +800,12 @@ async def run_job(job_id: str):
         {
             "attempts": attempts + 1,
             "status": JobStatus.PROCESSING.value,
+            "progress": max(progress, 5),
             "status_message": "Starting",
             "updated_at": datetime.utcnow().isoformat(),
         }
     )
+    progress = max(progress, 5)
 
     local_path = f"/tmp/{job_id}_input"
 
@@ -702,49 +831,56 @@ async def run_job(job_id: str):
 
         source_blob = job.get("file_path") or job.get("upload_path")
         requested_language = normalize_language_code(job.get("language", "auto")) or "auto"
+        requires_diarization = bool(job.get("requires_diarization"))
 
         if not source_blob:
             raise RuntimeError("Job missing storage path")
 
+        update_progress(10, "Downloading upload")
         download_start_time = time.time()
         storage.download_to_file(source_blob, local_path)
         download_time_seconds = round(time.time() - download_start_time, 3)
 
         # ---------------------------------------------------------
-        # Run speaker diarization before transcription
+        # Run speaker diarization before transcription when requested
         # ---------------------------------------------------------
-        diarization_config_error = get_diarization_configuration_error()
-        if diarization_config_error:
-            diarization_error_message = diarization_config_error
-            diarization_status = "misconfigured"
-            diarization_time_seconds = 0.0
-            print(
-                "Skipping speaker diarization due to configuration issue:",
-                diarization_error_message,
-            )
+        if requires_diarization:
+            update_progress(25, "Analyzing speakers")
+            diarization_config_error = get_diarization_configuration_error()
+            if diarization_config_error:
+                diarization_error_message = diarization_config_error
+                diarization_status = "misconfigured"
+                diarization_time_seconds = 0.0
+                print(
+                    "Skipping speaker diarization due to configuration issue:",
+                    diarization_error_message,
+                )
+            else:
+                try:
+                    print("Running speaker diarization...")
+                    diarization_start_time = time.time()
+                    speaker_segments = await asyncio.to_thread(
+                        diarize_audio,
+                        local_path
+                    )
+                    diarization_time_seconds = round(time.time() - diarization_start_time, 3)
+                    print(f"Diarization segments detected: {len(speaker_segments)}")
+                    diarization_status = (
+                        "completed" if speaker_segments else "completed_empty"
+                    )
+                except Exception as diarization_error:
+                    diarization_time_seconds = round(time.time() - diarization_start_time, 3)
+                    print("Diarization failed but continuing transcription:", diarization_error)
+                    diarization_error_message = str(diarization_error)
+                    lowered_diarization_error = diarization_error_message.lower()
+                    if "hf_token" in lowered_diarization_error or "hugging face" in lowered_diarization_error:
+                        diarization_status = "misconfigured"
+                    else:
+                        diarization_status = "failed"
+                    speaker_segments = []
         else:
-            try:
-                print("Running speaker diarization...")
-                diarization_start_time = time.time()
-                speaker_segments = await asyncio.to_thread(
-                    diarize_audio,
-                    local_path
-                )
-                diarization_time_seconds = round(time.time() - diarization_start_time, 3)
-                print(f"Diarization segments detected: {len(speaker_segments)}")
-                diarization_status = (
-                    "completed" if speaker_segments else "completed_empty"
-                )
-            except Exception as diarization_error:
-                diarization_time_seconds = round(time.time() - diarization_start_time, 3)
-                print("Diarization failed but continuing transcription:", diarization_error)
-                diarization_error_message = str(diarization_error)
-                lowered_diarization_error = diarization_error_message.lower()
-                if "hf_token" in lowered_diarization_error or "hugging face" in lowered_diarization_error:
-                    diarization_status = "misconfigured"
-                else:
-                    diarization_status = "failed"
-                speaker_segments = []
+            diarization_status = "skipped"
+            diarization_time_seconds = 0.0
         # ---------------------------------------------------------
 
         if os.path.exists(local_path):
@@ -760,11 +896,19 @@ async def run_job(job_id: str):
                 f"Audio exceeds maximum allowed duration ({MAX_AUDIO_DURATION_SECONDS} seconds)"
             )
 
+        update_progress(55, "Transcribing audio")
         transcription_start_time = time.time()
+
+        def transcription_progress(next_progress: int, message: str) -> None:
+            bounded_progress = max(0, min(100, int(next_progress)))
+            mapped_progress = 55 + int((bounded_progress / 100) * 19)
+            update_progress(mapped_progress, message)
+
         result = await asyncio.wait_for(
             transcribe_with_optional_chunking(
                 local_path,
                 language=requested_language,
+                progress_cb=transcription_progress,
             ),
             timeout=PROCESS_ATTEMPT_TIMEOUT_SECONDS,
         )
@@ -772,8 +916,10 @@ async def run_job(job_id: str):
         final_language = result.get("language") or requested_language
         detected_language = result.get("language_detected")
 
+        update_progress(75, "Preparing transcript")
         alignment_start_time = time.time()
-        align_speakers(result, speaker_segments)
+        if requires_diarization and speaker_segments:
+            align_speakers(result, speaker_segments)
         alignment_time_seconds = round(time.time() - alignment_start_time, 3)
         result["speaker_segments"] = speaker_segments
         result["diarization"] = {
@@ -782,6 +928,7 @@ async def run_job(job_id: str):
         }
         labeled_segments_count = _count_speaker_labeled_segments(result)
 
+        update_progress(90, "Saving transcript files")
         output_start_time = time.time()
         save_outputs(storage, job_id, result)
         output_time_seconds = round(time.time() - output_start_time, 3)
@@ -888,11 +1035,15 @@ async def run_job(job_id: str):
 # ---------------------------------------------------------
 # Worker Entry
 # ---------------------------------------------------------
-def process_next_job(worker_id: str):
+def process_next_job(worker_id: str, requested_job_id: Optional[str] = None):
 
     print(f"Worker {worker_id} checking queue...")
 
-    job_id = claim_one_queued_job()
+    job_id = (
+        claim_specific_queued_job(requested_job_id)
+        if requested_job_id
+        else claim_one_queued_job()
+    )
 
     if not job_id:
         return False
@@ -975,6 +1126,7 @@ def _build_podcast_html(
     diarization: Optional[Dict[str, Any]] = None,
 ) -> str:
     blocks = _build_transcript_blocks(segments)
+    has_speaker_labels = _has_speaker_labels(segments)
 
     html = [
         "<!DOCTYPE html>",
@@ -986,135 +1138,183 @@ def _build_podcast_html(
         "<style>",
         ":root {",
         "  color-scheme: light;",
-        "  --bg: #f6efe2;",
-        "  --panel: #fffdf9;",
-        "  --text: #1f1a17;",
-        "  --muted: #6f655c;",
-        "  --border: #e8dccd;",
-        "  --accent: #b25b2a;",
-        "  --accent-soft: #f6e5d8;",
+        "  --page-bg: #f8fafc;",
+        "  --page-grad-a: rgba(40, 41, 126, 0.12);",
+        "  --page-grad-b: rgba(99, 102, 241, 0.08);",
+        "  --panel: rgba(255, 255, 255, 0.94);",
+        "  --panel-strong: #ffffff;",
+        "  --text: #101426;",
+        "  --muted: #667085;",
+        "  --border: rgba(40, 41, 126, 0.12);",
+        "  --accent: #28297e;",
+        "  --accent-soft: rgba(99, 102, 241, 0.08);",
+        "  --shadow: 0 18px 50px rgba(15, 23, 42, 0.08);",
         "}",
         "* { box-sizing: border-box; }",
         "body {",
         "  margin: 0;",
-        "  font-family: Georgia, 'Times New Roman', serif;",
+        "  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;",
         "  background:",
-        "    radial-gradient(circle at top, #fff8ef 0%, var(--bg) 58%, #eadcca 100%);",
+        "    radial-gradient(circle at top left, var(--page-grad-a) 0%, transparent 28%),",
+        "    radial-gradient(circle at top right, var(--page-grad-b) 0%, transparent 24%),",
+        "    linear-gradient(180deg, #ffffff 0%, var(--page-bg) 100%);",
         "  color: var(--text);",
         "}",
         ".page {",
-        "  width: min(900px, calc(100% - 24px));",
-        "  margin: 24px auto 48px;",
+        "  width: min(980px, calc(100% - 24px));",
+        "  margin: 20px auto 40px;",
         "}",
         ".hero {",
-        "  background: linear-gradient(135deg, rgba(178, 91, 42, 0.10), rgba(255, 255, 255, 0.92));",
+        "  position: relative;",
+        "  overflow: hidden;",
+        "  background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(250,251,255,0.96));",
         "  border: 1px solid var(--border);",
-        "  border-radius: 24px;",
-        "  padding: 24px 22px;",
-        "  box-shadow: 0 14px 40px rgba(78, 54, 31, 0.08);",
+        "  border-radius: 34px;",
+        "  padding: 28px 24px 24px;",
+        "  box-shadow: var(--shadow);",
+        "}",
+        ".hero::before {",
+        "  content: '';",
+        "  position: absolute;",
+        "  inset: -40% auto auto 58%;",
+        "  width: 260px;",
+        "  height: 260px;",
+        "  background: radial-gradient(circle, rgba(99,102,241,0.18) 0%, rgba(99,102,241,0) 72%);",
+        "  pointer-events: none;",
         "}",
         ".eyebrow {",
         "  margin: 0 0 8px;",
-        "  font: 600 0.78rem/1.2 Arial, sans-serif;",
-        "  letter-spacing: 0.14em;",
+        "  font-size: 0.78rem;",
+        "  font-weight: 700;",
+        "  line-height: 1.2;",
+        "  letter-spacing: 0.18em;",
         "  text-transform: uppercase;",
         "  color: var(--accent);",
         "}",
         "h1 {",
         "  margin: 0;",
-        "  font-size: clamp(2rem, 4vw, 3.2rem);",
-        "  line-height: 0.96;",
+        "  max-width: 14ch;",
+        "  font-size: clamp(2.2rem, 5vw, 4.4rem);",
+        "  line-height: 0.94;",
+        "  letter-spacing: -0.05em;",
+        "  font-weight: 800;",
         "}",
-        ".subtitle {",
-        "  margin: 12px 0 0;",
+        ".hero-copy {",
+        "  position: relative;",
+        "  z-index: 1;",
+        "}",
+        ".lede {",
+        "  max-width: 640px;",
+        "  margin: 14px 0 0;",
         "  color: var(--muted);",
-        "  font: 400 1rem/1.6 Arial, sans-serif;",
+        "  font-size: 1rem;",
+        "  line-height: 1.75;",
         "}",
-        ".note {",
-        "  margin: 18px 0 0;",
-        "  padding: 12px 14px;",
-        "  border-left: 4px solid var(--accent);",
-        "  border-radius: 12px;",
-        "  background: var(--accent-soft);",
-        "  color: #5c331b;",
-        "  font: 400 0.95rem/1.5 Arial, sans-serif;",
+        ".meta-row {",
+        "  display: flex;",
+        "  flex-wrap: wrap;",
+        "  gap: 10px;",
+        "  margin-top: 18px;",
+        "}",
+        ".pill {",
+        "  display: inline-flex;",
+        "  align-items: center;",
+        "  gap: 8px;",
+        "  border-radius: 999px;",
+        "  border: 1px solid rgba(40, 41, 126, 0.12);",
+        "  background: rgba(240, 243, 255, 0.78);",
+        "  padding: 10px 14px;",
+        "  color: var(--accent);",
+        "  font-size: 0.82rem;",
+        "  font-weight: 700;",
+        "  letter-spacing: 0.04em;",
         "}",
         ".transcript {",
         "  display: grid;",
-        "  gap: 16px;",
-        "  margin-top: 20px;",
+        "  gap: 18px;",
+        "  margin-top: 22px;",
         "}",
         ".block {",
-        "  padding: 18px 18px 16px;",
+        "  padding: 20px 20px 18px;",
         "  border: 1px solid var(--border);",
-        "  border-radius: 20px;",
-        "  background: rgba(255, 253, 249, 0.96);",
-        "  box-shadow: 0 10px 26px rgba(78, 54, 31, 0.05);",
+        "  border-radius: 28px;",
+        "  background: var(--panel-strong);",
+        "  box-shadow: var(--shadow);",
         "}",
         ".meta {",
         "  display: flex;",
         "  flex-wrap: wrap;",
         "  gap: 8px 12px;",
         "  align-items: baseline;",
-        "  margin-bottom: 10px;",
+        "  margin-bottom: 12px;",
         "}",
         ".speaker {",
-        "  font: 700 0.96rem/1.2 Arial, sans-serif;",
-        "  letter-spacing: 0.06em;",
+        "  font-size: 0.86rem;",
+        "  font-weight: 800;",
+        "  line-height: 1.2;",
+        "  letter-spacing: 0.14em;",
         "  text-transform: uppercase;",
+        "  color: var(--accent);",
         "}",
         ".timestamp {",
         "  color: var(--muted);",
-        "  font: 600 0.83rem/1.2 Arial, sans-serif;",
+        "  font-size: 0.82rem;",
+        "  font-weight: 600;",
+        "  line-height: 1.2;",
         "}",
         ".block p {",
-        "  margin: 0 0 12px;",
-        "  font-size: 1.18rem;",
-        "  line-height: 1.72;",
+        "  margin: 0 0 14px;",
+        "  font-size: 1.03rem;",
+        "  line-height: 1.9;",
+        "  color: #24304a;",
         "}",
         ".block p:last-child { margin-bottom: 0; }",
         "@media (max-width: 640px) {",
         "  .page { width: min(100% - 16px, 100%); margin: 12px auto 28px; }",
-        "  .hero { padding: 18px 16px; border-radius: 18px; }",
-        "  .block { padding: 14px 14px 12px; border-radius: 16px; }",
-        "  .block p { font-size: 1.04rem; line-height: 1.62; }",
+        "  .hero { padding: 22px 18px 18px; border-radius: 24px; }",
+        "  h1 { max-width: 100%; font-size: 2.8rem; }",
+        "  .block { padding: 16px; border-radius: 22px; }",
+        "  .block p { font-size: 0.98rem; line-height: 1.8; }",
         "}",
         "</style>",
         "</head>",
         "<body>",
         "<main class='page'>",
         "<section class='hero'>",
-        "<p class='eyebrow'>Transcript Export</p>",
-        "<h1>Podcast Transcript</h1>",
-        f"<p class='subtitle'>Job {escape(job_id)}. Speaker-labeled transcript grouped into readable sections.</p>",
+        "<div class='hero-copy'>",
+        "<p class='eyebrow'>Kreyai Transcript</p>",
+        f"<h1>{'Speaker-Labeled Transcript' if has_speaker_labels else 'Transcript'}</h1>",
+        "<p class='lede'>Structured, readable output designed for review, editing, and publishing without cleanup work.</p>",
+        "<div class='meta-row'>",
+        f"<span class='pill'>Job {escape(job_id)}</span>",
+        f"<span class='pill'>{'Speaker labels included' if has_speaker_labels else 'Clean paragraph format'}</span>",
+        "</div>",
+        "</div>",
     ]
-
-    diarization = diarization or {}
-    diarization_status = str(diarization.get("status") or "").strip()
-    diarization_error = str(diarization.get("error") or "").strip()
-
-    if diarization_status and diarization_status != "completed":
-        note = f"Speaker diarization unavailable ({diarization_status})."
-        if diarization_error:
-            note = f"{note} {diarization_error}"
-        html.append(f"<p class='note'>{escape(note)}</p>")
 
     html.extend([
         "</section>",
         "<section class='transcript'>",
     ])
 
-    for spk, time_value, text in blocks:
-        html.append("<article class='block'>")
-        html.append(
-            "<div class='meta'>"
-            f"<span class='speaker'>{escape(str(spk))}</span>"
-            f"<span class='timestamp'>{_format_hhmmss(float(time_value))}</span>"
-            "</div>"
-        )
-        for paragraph in _split_transcript_paragraphs(text.strip()):
+    if has_speaker_labels:
+        for spk, time_value, text in blocks:
+            html.append("<article class='block'>")
+            html.append(
+                "<div class='meta'>"
+                f"<span class='speaker'>{escape(str(spk))}</span>"
+                f"<span class='timestamp'>{_format_hhmmss(float(time_value))}</span>"
+                "</div>"
+            )
+            for paragraph in _split_transcript_paragraphs(text.strip()):
+                html.append(f"<p>{escape(paragraph)}</p>")
+            html.append("</article>")
+    else:
+        paragraph_text = _build_plain_paragraph_transcript(segments).strip()
+        for paragraph in paragraph_text.split("\n\n") if paragraph_text else []:
+            html.append("<article class='block'>")
             html.append(f"<p>{escape(paragraph)}</p>")
-        html.append("</article>")
+            html.append("</article>")
 
     html.extend([
         "</section>",
@@ -1132,7 +1332,14 @@ def _build_podcast_html(
 def save_outputs(storage, job_id: str, result: Dict[str, Any]):
     text = (result.get("text") or "").strip()
     segments = _segments_from_result(result)
-    transcript_text = _build_transcript_text(segments) if segments else (text + "\n" if text else "")
+    if segments:
+        transcript_text = (
+            _build_transcript_text(segments)
+            if _has_speaker_labels(segments)
+            else _build_plain_paragraph_transcript(segments)
+        )
+    else:
+        transcript_text = (apply_formatting(text) + "\n") if text else ""
 
     storage.save_output(
         job_id,
