@@ -114,7 +114,7 @@ def _get_pipeline() -> Pipeline:
         # Optional GPU acceleration
         if torch.cuda.is_available():
             print("Using GPU for diarization")
-            _PIPELINE.to("cuda")
+            _PIPELINE.to(torch.device("cuda"))
         else:
             print("Using CPU for diarization")
 

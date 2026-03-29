@@ -8,7 +8,8 @@ def normalize_audio(input_path: str) -> str:
     mono 16kHz wav.
     """
 
-    output_path = input_path + "_normalized.wav"
+    root, _ext = os.path.splitext(input_path)
+    output_path = root + "_normalized.wav"
 
     cmd = [
         "ffmpeg",

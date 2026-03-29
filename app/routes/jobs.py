@@ -35,7 +35,7 @@ from app.processing.routing import resolve_processing_route
 from app.events.recorder import record_event, get_events
 from app.storage.backend import get_storage
 from app.services.access_control import resolve_submission_access, serialize_access_decision
-from app.services.email_service import send_verification_email
+from app.services.email_service import send_internal_new_order_email, send_verification_email
 from app.transcription.engine import normalize_language_code
 from app.security.job_tokens import (
     JobTokenConfig,
@@ -385,6 +385,7 @@ def finalize_upload(
     job_id: str,
     payload: FinalizeUploadRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
 ):
     _require_token(request, job_id)
 
@@ -453,6 +454,20 @@ def finalize_upload(
             status_code=503,
             detail="Upload received, but processing could not be started. Please try again.",
         ) from exc
+
+    background_tasks.add_task(
+        send_internal_new_order_email,
+        job_id=job_id,
+        customer_email=str(job.get("email") or ""),
+        language=str(job.get("language") or "auto"),
+        speaker_mode=str(payload.speaker_mode),
+        processing_tier=str(route.get("processing_tier") or "standard"),
+        execution_lane=str(route.get("execution_lane") or "cpu"),
+        worker_job_name=str(route.get("worker_job_name") or ""),
+        file_path=file_path,
+        size_bytes=int(payload.size_bytes),
+        content_type=str(payload.content_type),
+    )
 
     return {"message": "Upload finalized and job queued"}
 

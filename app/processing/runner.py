@@ -8,6 +8,7 @@ from datetime import datetime
 import time
 from html import escape
 from io import BytesIO
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from google.cloud import firestore
@@ -29,10 +30,12 @@ from app.transcription.diarization import (
 )
 from app.storage.backend import get_storage
 from app.events.recorder import record_event
+from app.processing.audio_preprocess import normalize_audio
 
 try:
     from app.services.email_service import send_completion_email
-except Exception:
+except Exception as email_import_error:
+    print(f"⚠️ Completion email service unavailable: {email_import_error}")
     send_completion_email = None
 
 
@@ -807,7 +810,8 @@ async def run_job(job_id: str):
     )
     progress = max(progress, 5)
 
-    local_path = f"/tmp/{job_id}_input"
+    local_path = None
+    diarization_input_path = None
 
     try:
 
@@ -836,6 +840,9 @@ async def run_job(job_id: str):
         if not source_blob:
             raise RuntimeError("Job missing storage path")
 
+        source_suffix = Path(str(source_blob)).suffix
+        local_path = f"/tmp/{job_id}_input{source_suffix}" if source_suffix else f"/tmp/{job_id}_input"
+
         update_progress(10, "Downloading upload")
         download_start_time = time.time()
         storage.download_to_file(source_blob, local_path)
@@ -859,9 +866,13 @@ async def run_job(job_id: str):
                 try:
                     print("Running speaker diarization...")
                     diarization_start_time = time.time()
+                    diarization_input_path = await asyncio.to_thread(
+                        normalize_audio,
+                        local_path,
+                    )
                     speaker_segments = await asyncio.to_thread(
                         diarize_audio,
-                        local_path
+                        diarization_input_path
                     )
                     diarization_time_seconds = round(time.time() - diarization_start_time, 3)
                     print(f"Diarization segments detected: {len(speaker_segments)}")
@@ -1028,8 +1039,10 @@ async def run_job(job_id: str):
 
     finally:
 
-        if os.path.exists(local_path):
+        if local_path and os.path.exists(local_path):
             os.remove(local_path)
+        if diarization_input_path and os.path.exists(diarization_input_path):
+            os.remove(diarization_input_path)
 
 
 # ---------------------------------------------------------
