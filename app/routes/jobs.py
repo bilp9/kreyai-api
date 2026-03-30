@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import tempfile
 import time
 import uuid
 from collections import defaultdict, deque
@@ -32,9 +33,11 @@ from app.state.firestore_jobs import (
 )
 from app.processing.dispatcher import dispatch_job
 from app.processing.routing import resolve_processing_route
+from app.processing.runner import get_audio_duration_seconds
 from app.events.recorder import record_event, get_events
 from app.storage.backend import get_storage
 from app.services.access_control import resolve_submission_access, serialize_access_decision
+from app.services.credits import consume_credit_minutes, refund_credit_minutes
 from app.services.email_service import send_internal_new_order_email, send_verification_email
 from app.transcription.engine import normalize_language_code
 from app.security.job_tokens import (
@@ -189,6 +192,22 @@ def _validate_upload_path(job_id: str, file_path: str) -> str:
         )
 
     return normalized_path
+
+
+def _probe_uploaded_audio_duration_seconds(file_path: str) -> float:
+    storage = get_storage()
+    suffix = os.path.splitext(file_path)[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        local_path = tmp.name
+
+    try:
+        storage.download_to_file(file_path, local_path)
+        return float(get_audio_duration_seconds(local_path))
+    finally:
+        try:
+            os.unlink(local_path)
+        except OSError:
+            pass
 
 
 # -------------------------------------------------
@@ -394,7 +413,18 @@ def finalize_upload(
         raise HTTPException(404, "Job not found")
 
     file_path = _validate_upload_path(job_id, payload.file_path)
-    access_decision = resolve_submission_access(str(job.get("email") or ""))
+    try:
+        audio_duration_seconds = _probe_uploaded_audio_duration_seconds(file_path)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unable to inspect uploaded media duration: {exc}",
+        ) from exc
+
+    access_decision = resolve_submission_access(
+        str(job.get("email") or ""),
+        audio_duration_seconds=audio_duration_seconds,
+    )
     route = resolve_processing_route(payload.speaker_mode)
 
     if not access_decision.allowed:
@@ -402,15 +432,57 @@ def finalize_upload(
             job_id,
             {
                 "status": JobStatus.VERIFIED,
-                "status_message": "Payment is required before this job can be processed.",
+                "status_message": "Credits are required before this job can be processed.",
                 "access_decision": serialize_access_decision(access_decision),
+                "audio_duration_seconds": audio_duration_seconds,
                 "updated_at": _utcnow_iso(),
             },
         )
         raise HTTPException(
             status_code=402,
-            detail="Payment is required before this job can be processed.",
+            detail={
+                "message": "Insufficient credits for this upload.",
+                "required_minutes": access_decision.credits_to_deduct,
+                "available_minutes": access_decision.available_credits,
+                "missing_minutes": access_decision.missing_credits,
+                "audio_duration_seconds": audio_duration_seconds,
+            },
         )
+
+    credits_charged_minutes = 0
+    if (
+        access_decision.requires_credit_check
+        and access_decision.source == "credits"
+        and access_decision.reason == "credits_ok"
+        and access_decision.credits_to_deduct > 0
+    ):
+        try:
+            consume_credit_minutes(
+                email=str(job.get("email") or ""),
+                minutes=int(access_decision.credits_to_deduct),
+                idempotency_key=f"job_debit:{job_id}",
+                source="job_finalize_upload",
+                description=f"Reserved credits for job {job_id}",
+                metadata={
+                    "job_id": job_id,
+                    "speaker_mode": payload.speaker_mode,
+                    "processing_tier": route.get("processing_tier"),
+                },
+            )
+            credits_charged_minutes = int(access_decision.credits_to_deduct)
+        except ValueError as exc:
+            if str(exc) == "insufficient_credits":
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "message": "Insufficient credits for this upload.",
+                        "required_minutes": access_decision.credits_to_deduct,
+                        "available_minutes": 0,
+                        "missing_minutes": access_decision.credits_to_deduct,
+                        "audio_duration_seconds": audio_duration_seconds,
+                    },
+                ) from exc
+            raise
 
     fs_update_job(
         job_id,
@@ -418,6 +490,8 @@ def finalize_upload(
             "file_path": file_path,
             "size_bytes": payload.size_bytes,
             "content_type": payload.content_type,
+            "audio_duration_seconds": audio_duration_seconds,
+            "credits_charged_minutes": credits_charged_minutes,
             **route,
             "status": JobStatus.QUEUED,
             "status_message": (
@@ -441,6 +515,15 @@ def finalize_upload(
             requires_diarization=bool(route["requires_diarization"]),
         )
     except Exception as exc:
+        if credits_charged_minutes > 0:
+            refund_credit_minutes(
+                email=str(job.get("email") or ""),
+                minutes=credits_charged_minutes,
+                idempotency_key=f"job_refund_dispatch:{job_id}",
+                source="dispatch_failure",
+                description=f"Returned credits after dispatch failure for {job_id}",
+                metadata={"job_id": job_id},
+            )
         fs_update_job(
             job_id,
             {

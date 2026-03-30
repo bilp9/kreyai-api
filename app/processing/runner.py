@@ -31,6 +31,7 @@ from app.transcription.diarization import (
 from app.storage.backend import get_storage
 from app.events.recorder import record_event
 from app.processing.audio_preprocess import normalize_audio
+from app.services.credits import refund_credit_minutes
 
 try:
     from app.services.email_service import send_completion_email
@@ -989,6 +990,19 @@ async def run_job(job_id: str):
                 print("Email error", e)
 
     except Exception as e:
+        charged_minutes = int(job.get("credits_charged_minutes") or 0)
+        if charged_minutes > 0:
+            try:
+                refund_credit_minutes(
+                    email=str(job.get("email") or ""),
+                    minutes=charged_minutes,
+                    idempotency_key=f"job_refund_failure:{job_id}",
+                    source="processing_failure",
+                    description=f"Returned credits after failed job {job_id}",
+                    metadata={"job_id": job_id},
+                )
+            except Exception as refund_error:
+                print(f"⚠️ Credit refund failed for {job_id}: {refund_error}")
 
         failure_update = {
             "status": JobStatus.FAILED.value,

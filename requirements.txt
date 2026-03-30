@@ -10,6 +10,8 @@ google-cloud-storage
 python-docx
 google-cloud-firestore
 google-cloud-run
+httpx
+stripe
 huggingface_hub
 torch
 torchaudio
