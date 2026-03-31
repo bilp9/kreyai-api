@@ -38,7 +38,7 @@ from app.events.recorder import record_event, get_events
 from app.storage.backend import get_storage
 from app.services.access_control import resolve_submission_access, serialize_access_decision
 from app.services.credits import consume_credit_minutes, refund_credit_minutes
-from app.services.email_service import send_internal_new_order_email, send_verification_email
+from app.services.email_service import send_files_deleted_email, send_internal_new_order_email, send_verification_email
 from app.transcription.engine import normalize_language_code
 from app.security.job_tokens import (
     JobTokenConfig,
@@ -210,6 +210,10 @@ def _probe_uploaded_audio_duration_seconds(file_path: str) -> float:
             pass
 
 
+def _job_files_deleted(job: dict) -> bool:
+    return bool(job.get("files_deleted_at"))
+
+
 # -------------------------------------------------
 # 1️⃣ Create Job
 # -------------------------------------------------
@@ -293,6 +297,8 @@ def verify_job_route(job_id: str, code: str, request: Request):
     job = fs_get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
+    if _job_files_deleted(job):
+        raise HTTPException(status_code=410, detail="Files for this job were deleted at the customer's request.")
 
     if job.get("verified"):
         raise HTTPException(400, "Job already verified")
@@ -570,6 +576,51 @@ def get_job_route(job_id: str, request: Request):
     return job
 
 
+@router.post("/jobs/{job_id}/delete-files")
+def delete_job_files_route(job_id: str, request: Request, background_tasks: BackgroundTasks):
+    _require_token(request, job_id)
+
+    job = fs_get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    if _job_files_deleted(job):
+        return {
+            "message": "Files were already deleted.",
+            "files_deleted_at": job.get("files_deleted_at"),
+            "deleted_blob_count": int(job.get("deleted_blob_count") or 0),
+        }
+
+    deleted_blob_count = get_storage().delete_job_files(job_id)
+    deleted_at = _utcnow_iso()
+    current_status = str(job.get("status") or "")
+    next_status = "customer_deleted" if current_status.lower() == JobStatus.COMPLETED.value else current_status
+
+    fs_update_job(
+        job_id,
+        {
+            "status": next_status,
+            "status_message": (
+                "Files were deleted from active storage at your request. Download links no longer work. "
+                "If you need them again, please submit a new request."
+            ),
+            "files_deleted_at": deleted_at,
+            "deleted_blob_count": deleted_blob_count,
+            "updated_at": deleted_at,
+        },
+    )
+    record_event(job_id, "files_deleted", "Customer requested immediate file deletion", next_status)
+
+    if job.get("email"):
+        background_tasks.add_task(send_files_deleted_email, str(job.get("email")), job_id)
+
+    return {
+        "message": "Files deleted successfully.",
+        "files_deleted_at": deleted_at,
+        "deleted_blob_count": deleted_blob_count,
+    }
+
+
 @router.get("/jobs/{job_id}/events")
 def get_job_events_route(job_id: str, request: Request):
     _require_token(request, job_id)
@@ -583,32 +634,72 @@ def get_job_events_route(job_id: str, request: Request):
 @router.get("/jobs/{job_id}/docx")
 def download_docx_route(job_id: str, request: Request):
     _require_token(request, job_id)
-    url = get_storage().get_download_url(job_id, "transcript.docx")
+    job = fs_get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if _job_files_deleted(job):
+        raise HTTPException(status_code=410, detail="Files for this job were deleted at the customer's request.")
+    try:
+        url = get_storage().get_download_url(job_id, "transcript.docx")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return RedirectResponse(url, status_code=302)
 
 
 @router.get("/jobs/{job_id}/txt")
 def download_txt_route(job_id: str, request: Request):
     _require_token(request, job_id)
-    url = get_storage().get_download_url(job_id, "transcript.txt")
+    job = fs_get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if _job_files_deleted(job):
+        raise HTTPException(status_code=410, detail="Files for this job were deleted at the customer's request.")
+    try:
+        url = get_storage().get_download_url(job_id, "transcript.txt")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return RedirectResponse(url, status_code=302)
 
 
 @router.get("/jobs/{job_id}/srt")
 def download_srt_route(job_id: str, request: Request):
     _require_token(request, job_id)
-    url = get_storage().get_download_url(job_id, "transcript.srt")
+    job = fs_get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if _job_files_deleted(job):
+        raise HTTPException(status_code=410, detail="Files for this job were deleted at the customer's request.")
+    try:
+        url = get_storage().get_download_url(job_id, "transcript.srt")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return RedirectResponse(url, status_code=302)
 
 
 @router.get("/jobs/{job_id}/vtt")
 def download_vtt_route(job_id: str, request: Request):
     _require_token(request, job_id)
-    url = get_storage().get_download_url(job_id, "transcript.vtt")
+    job = fs_get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if _job_files_deleted(job):
+        raise HTTPException(status_code=410, detail="Files for this job were deleted at the customer's request.")
+    try:
+        url = get_storage().get_download_url(job_id, "transcript.vtt")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return RedirectResponse(url, status_code=302)
 
 @router.get("/jobs/{job_id}/html")
 def download_html_route(job_id: str, request: Request):
     _require_token(request, job_id)
-    url = get_storage().get_download_url(job_id, "transcript.html")
+    job = fs_get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if _job_files_deleted(job):
+        raise HTTPException(status_code=410, detail="Files for this job were deleted at the customer's request.")
+    try:
+        url = get_storage().get_download_url(job_id, "transcript.html")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return RedirectResponse(url, status_code=302)

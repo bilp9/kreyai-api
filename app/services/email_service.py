@@ -12,7 +12,7 @@ INTERNAL_ORDER_NOTIFICATION_EMAILS = [
     email.strip()
     for email in os.getenv(
         "INTERNAL_ORDER_NOTIFICATION_EMAILS",
-        "support@kreyai.com,billy@kreyai.com",
+        "support@kreyai.com",
     ).split(",")
     if email.strip()
 ]
@@ -170,6 +170,11 @@ async def send_completion_email(email: str, job_id: str):
         again after 7 days, please submit a new job.
       </p>
 
+      <p style="font-size:13px; color:#777;">
+        If you want your files removed sooner, use the delete option on your job page. Once deleted, download links
+        stop working immediately and a new request is required if you need the files again.
+      </p>
+
       <p>Thank you for using KreyAI.</p>
     </div>
     """
@@ -177,6 +182,78 @@ async def send_completion_email(email: str, job_id: str):
     await _send_email(
         email,
         f"Your KreyAI transcription is ready — {job_id}",
+        html_content,
+    )
+
+
+async def send_credit_purchase_confirmation_email(
+    *,
+    email: str,
+    pack_name: str,
+    credits_minutes: int,
+    balance_minutes: int,
+    amount_total_cents: int | None = None,
+):
+    amount_line = ""
+    if isinstance(amount_total_cents, int) and amount_total_cents > 0:
+        amount_line = f"""
+      <p style="font-size:13px; color:#777;">
+        Charged: ${amount_total_cents / 100:.2f}
+      </p>
+        """
+
+    html_content = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.6; color:#111;">
+      <h2>Your KreyAI credits are ready</h2>
+
+      <p>We received your purchase successfully and added credits to your account.</p>
+
+      <ul>
+        <li><strong>Pack:</strong> {pack_name}</li>
+        <li><strong>Minutes added:</strong> {credits_minutes}</li>
+        <li><strong>Current balance:</strong> {balance_minutes} minutes</li>
+      </ul>
+
+      {amount_line}
+
+      <p>
+        You can review your balance any time on the
+        <a href="{FRONTEND_BASE_URL}/billing?email={email}">billing page</a>.
+      </p>
+
+      <p>Thank you for using KreyAI.</p>
+    </div>
+    """
+
+    await _send_email(
+        email,
+        "Your KreyAI minutes are available",
+        html_content,
+    )
+
+
+async def send_files_deleted_email(email: str, job_id: str):
+    html_content = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.6; color:#111;">
+      <h2>Your KreyAI files were deleted</h2>
+
+      <p>The uploaded media and generated outputs for job <strong>{job_id}</strong> were deleted from active storage at your request.</p>
+
+      <p style="font-size:13px; color:#777;">
+        All download links for this job will no longer work.
+      </p>
+
+      <p style="font-size:13px; color:#777;">
+        If you need those files again, please submit a new request.
+      </p>
+
+      <p>Thank you for using KreyAI.</p>
+    </div>
+    """
+
+    await _send_email(
+        email,
+        f"Your KreyAI files were deleted — {job_id}",
         html_content,
     )
 

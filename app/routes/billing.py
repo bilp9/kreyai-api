@@ -3,7 +3,13 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from app.services.credits import add_credit_minutes, get_credit_account, normalize_billing_email
+from app.services.credits import (
+    add_credit_minutes,
+    ensure_starter_credit_grant,
+    get_credit_account,
+    normalize_billing_email,
+)
+from app.services.email_service import send_credit_purchase_confirmation_email
 from app.services.stripe_billing import (
     create_checkout_session,
     get_credit_pack,
@@ -55,11 +61,13 @@ def get_balance(email: str = Query(...)):
     if not normalized:
         raise HTTPException(status_code=400, detail="Email is required.")
 
+    ensure_starter_credit_grant(normalized)
     account = get_credit_account(normalized)
     return {
         "email": account.email,
         "balance_minutes": account.balance_minutes,
         "total_purchased_minutes": account.total_purchased_minutes,
+        "total_granted_minutes": account.total_granted_minutes,
         "total_consumed_minutes": account.total_consumed_minutes,
         "total_refunded_minutes": account.total_refunded_minutes,
         "stripe_customer_id": account.stripe_customer_id,
@@ -110,7 +118,8 @@ async def stripe_webhook_route(request: Request):
             credits_minutes = int(metadata.get("credits_minutes") or 0)
             session_id = str(getattr(session, "id", "") or "")
             if email and pack_id and credits_minutes > 0 and session_id:
-                add_credit_minutes(
+                pack = get_credit_pack(pack_id)
+                result = add_credit_minutes(
                     email=email,
                     minutes=credits_minutes,
                     source="stripe_checkout",
@@ -123,5 +132,13 @@ async def stripe_webhook_route(request: Request):
                     },
                     stripe_customer_id=getattr(session, "customer", None),
                 )
+                if result.get("applied"):
+                    await send_credit_purchase_confirmation_email(
+                        email=email,
+                        pack_name=pack.name,
+                        credits_minutes=credits_minutes,
+                        balance_minutes=int(result.get("balance_minutes") or 0),
+                        amount_total_cents=getattr(session, "amount_total", None),
+                    )
 
     return {"received": True}

@@ -108,6 +108,13 @@ class GCSStorage:
     def blob_exists(self, blob_path: str) -> bool:
         return self.bucket.blob(blob_path).exists()
 
+    def delete_prefix(self, prefix: str) -> int:
+        deleted = 0
+        for blob in self.client.list_blobs(self.bucket_name, prefix=prefix):
+            blob.delete()
+            deleted += 1
+        return deleted
+
     # -------------------------------------------------
     # SAVE OUTPUT
     # -------------------------------------------------
@@ -162,6 +169,11 @@ class GCSStorage:
         )
 
         return url
+
+    def delete_job_files(self, job_id: str) -> int:
+        deleted_uploads = self.delete_prefix(f"jobs/{job_id}/uploads/")
+        deleted_outputs = self.delete_prefix(f"jobs/{job_id}/outputs/")
+        return deleted_uploads + deleted_outputs
 
 
 # -------------------------------------------------

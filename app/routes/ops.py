@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
@@ -10,6 +11,7 @@ from app.auth.auth import get_current_user
 from app.constants import JobStatus
 from app.models.user import User
 from app.services.access_control import resolve_submission_access, serialize_access_decision
+from app.services.credits import adjust_credit_minutes, ensure_starter_credit_grant, get_credit_account, list_credit_ledger
 from app.services.partner_plans import (
     get_partner_plan_status,
     grant_partner_plan,
@@ -23,6 +25,13 @@ router = APIRouter(prefix="/ops", tags=["ops"])
 
 class PartnerPlanRequest(BaseModel):
     email: str
+    notes: Optional[str] = None
+
+
+class BillingAdjustmentRequest(BaseModel):
+    email: str
+    action: str
+    minutes: int
     notes: Optional[str] = None
 
 
@@ -46,6 +55,10 @@ def _coerce_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _utcnow_compact() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
 
 
 @router.get("/dashboard")
@@ -191,6 +204,77 @@ def get_access_decision_route(
         "email": normalized_email,
         "access_decision": serialize_access_decision(decision),
         "partner_access": get_partner_plan_status(normalized_email),
+    }
+
+
+@router.get("/billing")
+def get_ops_billing_route(
+    email: str = Query(...),
+    limit: int = Query(50, ge=1, le=100),
+    user: User = Depends(get_current_user),
+):
+    normalized_email = _normalize_email(email)
+    ensure_starter_credit_grant(normalized_email)
+    account = get_credit_account(normalized_email)
+    ledger = list_credit_ledger(normalized_email, limit=limit)
+    decision = resolve_submission_access(normalized_email)
+
+    return {
+        "viewer": {
+            "id": user.id,
+            "email": user.email,
+        },
+        "email": normalized_email,
+        "account": asdict(account),
+        "access_decision": serialize_access_decision(decision),
+        "partner_access": get_partner_plan_status(normalized_email),
+        "ledger": [asdict(entry) for entry in ledger],
+    }
+
+
+@router.post("/billing/adjust")
+def adjust_billing_credits_route(
+    payload: BillingAdjustmentRequest,
+    user: User = Depends(get_current_user),
+):
+    normalized_email = _normalize_email(payload.email)
+    action = str(payload.action or "").strip().lower()
+    if action not in {"grant", "refund", "debit"}:
+        raise HTTPException(status_code=400, detail="Adjustment action must be grant, refund, or debit.")
+    minutes = int(payload.minutes or 0)
+    if minutes <= 0:
+        raise HTTPException(status_code=400, detail="Minutes must be greater than zero.")
+
+    try:
+        result = adjust_credit_minutes(
+            email=normalized_email,
+            minutes=minutes,
+            action=action,
+            idempotency_key=f"ops:{action}:{normalized_email}:{_utcnow_compact()}",
+            source="ops_manual_adjustment",
+            description=(payload.notes or f"Manual {action} by ops").strip(),
+            metadata={
+                "approved_by": user.email or user.id,
+                "notes": (payload.notes or "").strip(),
+                "action": action,
+            },
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        status = 400 if detail != "insufficient_credits" else 409
+        raise HTTPException(status_code=status, detail=detail) from exc
+
+    account = get_credit_account(normalized_email)
+    return {
+        "viewer": {
+            "id": user.id,
+            "email": user.email,
+        },
+        "email": normalized_email,
+        "action": action,
+        "minutes": minutes,
+        "result": result,
+        "account": asdict(account),
     }
 
 

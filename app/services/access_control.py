@@ -6,7 +6,7 @@ import os
 from typing import Any, Dict, Optional
 
 from app.services.partner_plans import get_partner_plan_status
-from app.services.credits import get_credit_balance_minutes
+from app.services.credits import ensure_starter_credit_grant, get_credit_balance_minutes
 
 
 @dataclass
@@ -68,6 +68,7 @@ def resolve_submission_access(
 
     if _credits_enforced():
         required_credits = billable_minutes or 0
+        ensure_starter_credit_grant(email)
         available_credits = get_credit_balance_minutes(email)
         missing_credits = max(0, required_credits - available_credits)
         return AccessDecision(
