@@ -5,8 +5,8 @@ from pydantic import BaseModel
 
 from app.services.credits import (
     add_credit_minutes,
-    ensure_starter_credit_grant,
     get_credit_account,
+    is_valid_billing_email,
     normalize_billing_email,
 )
 from app.services.email_service import send_credit_purchase_confirmation_email
@@ -58,27 +58,21 @@ def get_billing_config():
 @router.get("/balance")
 def get_balance(email: str = Query(...)):
     normalized = normalize_billing_email(email)
-    if not normalized:
-        raise HTTPException(status_code=400, detail="Email is required.")
+    if not is_valid_billing_email(normalized):
+        raise HTTPException(status_code=400, detail="A valid email is required.")
 
-    ensure_starter_credit_grant(normalized)
     account = get_credit_account(normalized)
     return {
         "email": account.email,
         "balance_minutes": account.balance_minutes,
-        "total_purchased_minutes": account.total_purchased_minutes,
-        "total_granted_minutes": account.total_granted_minutes,
-        "total_consumed_minutes": account.total_consumed_minutes,
-        "total_refunded_minutes": account.total_refunded_minutes,
-        "stripe_customer_id": account.stripe_customer_id,
     }
 
 
 @router.post("/checkout-session")
 def create_checkout_session_route(payload: CreateCheckoutSessionRequest):
     normalized = normalize_billing_email(payload.email)
-    if not normalized:
-        raise HTTPException(status_code=400, detail="Email is required.")
+    if not is_valid_billing_email(normalized):
+        raise HTTPException(status_code=400, detail="A valid email is required.")
     if not stripe_is_configured():
         raise HTTPException(status_code=503, detail="Stripe billing is not configured.")
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import re
 from typing import Any, Dict, Literal, Optional
 
 from google.cloud import firestore
@@ -11,6 +12,7 @@ db = firestore.Client()
 ACCOUNTS_COLLECTION = "credit_accounts"
 LEDGER_COLLECTION = "credit_ledger"
 STARTER_GRANT_MINUTES = 30
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _utcnow_iso() -> str:
@@ -19,6 +21,11 @@ def _utcnow_iso() -> str:
 
 def normalize_billing_email(email: str) -> str:
     return str(email or "").strip().lower()
+
+
+def is_valid_billing_email(email: str) -> bool:
+    normalized = normalize_billing_email(email)
+    return bool(normalized and EMAIL_PATTERN.match(normalized))
 
 
 @dataclass
@@ -53,6 +60,8 @@ def _account_doc(email: str):
 
 def get_credit_account(email: str) -> CreditAccount:
     normalized = normalize_billing_email(email)
+    if not is_valid_billing_email(normalized):
+        raise ValueError("email is required")
     snap = _account_doc(normalized).get()
     data = snap.to_dict() or {}
     return CreditAccount(
@@ -76,12 +85,7 @@ def list_credit_ledger(email: str, *, limit: int = 50) -> list[CreditLedgerEntry
     if not normalized:
         raise ValueError("email is required")
 
-    query = (
-        db.collection(LEDGER_COLLECTION)
-        .where("email", "==", normalized)
-        .order_by("created_at", direction=firestore.Query.DESCENDING)
-        .limit(max(1, min(int(limit or 50), 100)))
-    )
+    query = db.collection(LEDGER_COLLECTION).where("email", "==", normalized)
 
     entries: list[CreditLedgerEntry] = []
     for snap in query.stream():
@@ -99,12 +103,14 @@ def list_credit_ledger(email: str, *, limit: int = 50) -> list[CreditLedgerEntry
                 created_at=data.get("created_at"),
             )
         )
-    return entries
+
+    entries.sort(key=lambda entry: entry.created_at or "", reverse=True)
+    return entries[: max(1, min(int(limit or 50), 100))]
 
 
 def ensure_starter_credit_grant(email: str) -> Dict[str, Any]:
     normalized = normalize_billing_email(email)
-    if not normalized:
+    if not is_valid_billing_email(normalized):
         raise ValueError("email is required")
     if STARTER_GRANT_MINUTES <= 0:
         return {"applied": False, "balance_minutes": get_credit_balance_minutes(normalized)}

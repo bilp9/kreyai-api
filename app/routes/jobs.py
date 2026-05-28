@@ -38,7 +38,12 @@ from app.events.recorder import record_event, get_events
 from app.storage.backend import get_storage
 from app.services.access_control import resolve_submission_access, serialize_access_decision
 from app.services.credits import consume_credit_minutes, refund_credit_minutes
-from app.services.email_service import send_files_deleted_email, send_internal_new_order_email, send_verification_email
+from app.services.email_service import (
+    send_files_deleted_email,
+    send_internal_new_order_email,
+    send_job_access_email,
+    send_verification_email,
+)
 from app.transcription.engine import normalize_language_code
 from app.security.job_tokens import (
     JobTokenConfig,
@@ -51,6 +56,10 @@ from app.security.job_tokens import (
 router = APIRouter(prefix="/api", tags=["jobs"])
 _PUBLIC_RATE_LIMITS: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
 _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class JobAccessResendRequest(BaseModel):
+    email: str
 
 
 def _utcnow_iso() -> str:
@@ -212,6 +221,30 @@ def _probe_uploaded_audio_duration_seconds(file_path: str) -> float:
 
 def _job_files_deleted(job: dict) -> bool:
     return bool(job.get("files_deleted_at"))
+
+
+def _job_language(job: dict) -> str:
+    return str(
+        job.get("language_final")
+        or job.get("language")
+        or job.get("language_requested")
+        or ""
+    ).strip().lower()
+
+
+def _redirect_output_or_404(job_id: str, *filenames: str) -> RedirectResponse:
+    storage = get_storage()
+    last_error: RuntimeError | None = None
+
+    for filename in filenames:
+        try:
+            url = storage.get_download_url(job_id, filename)
+            return RedirectResponse(url, status_code=302)
+        except RuntimeError as exc:
+            last_error = exc
+
+    detail = str(last_error) if last_error else "Requested output was not found."
+    raise HTTPException(status_code=404, detail=detail)
 
 
 # -------------------------------------------------
@@ -431,7 +464,10 @@ def finalize_upload(
         str(job.get("email") or ""),
         audio_duration_seconds=audio_duration_seconds,
     )
-    route = resolve_processing_route(payload.speaker_mode)
+    route = resolve_processing_route(
+        payload.speaker_mode,
+        language=str(job.get("language") or ""),
+    )
 
     if not access_decision.allowed:
         fs_update_job(
@@ -576,6 +612,39 @@ def get_job_route(job_id: str, request: Request):
     return job
 
 
+@router.post("/jobs/{job_id}/resend-access")
+async def resend_job_access_route(
+    job_id: str,
+    payload: JobAccessResendRequest,
+    request: Request,
+):
+    _enforce_public_rate_limit(
+        request,
+        scope=f"resend_access:{job_id}",
+        limit=PUBLIC_VERIFY_RATE_LIMIT,
+    )
+
+    job = fs_get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    email = _normalize_email(payload.email)
+    if email != _normalize_email(str(job.get("email") or "")):
+        raise HTTPException(status_code=404, detail="Job not found for that email address.")
+
+    if not job.get("verified"):
+        raise HTTPException(status_code=409, detail="This job is not verified yet. Use the verification email first.")
+
+    await send_job_access_email(email, job_id)
+    record_event(job_id, "job_access_resent", "Customer requested a fresh job access link", str(job.get("status") or ""))
+
+    return {
+        "job_id": job_id,
+        "sent": True,
+        "message": "A fresh job link was sent to your email.",
+    }
+
+
 @router.post("/jobs/{job_id}/delete-files")
 def delete_job_files_route(job_id: str, request: Request, background_tasks: BackgroundTasks):
     _require_token(request, job_id)
@@ -630,6 +699,9 @@ def get_job_events_route(job_id: str, request: Request):
 # -------------------------------------------------
 # 6️⃣ Download Redirects
 # -------------------------------------------------
+# Customer routes intentionally expose only primary transcript artifacts.
+# Internal raw/clean/LLM/approved review artifacts stay behind ops auth until
+# collaborator-specific authorization is designed.
 
 @router.get("/jobs/{job_id}/docx")
 def download_docx_route(job_id: str, request: Request):
@@ -639,11 +711,7 @@ def download_docx_route(job_id: str, request: Request):
         raise HTTPException(404, "Job not found")
     if _job_files_deleted(job):
         raise HTTPException(status_code=410, detail="Files for this job were deleted at the customer's request.")
-    try:
-        url = get_storage().get_download_url(job_id, "transcript.docx")
-    except RuntimeError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return RedirectResponse(url, status_code=302)
+    return _redirect_output_or_404(job_id, "transcript.docx")
 
 
 @router.get("/jobs/{job_id}/txt")
@@ -654,11 +722,7 @@ def download_txt_route(job_id: str, request: Request):
         raise HTTPException(404, "Job not found")
     if _job_files_deleted(job):
         raise HTTPException(status_code=410, detail="Files for this job were deleted at the customer's request.")
-    try:
-        url = get_storage().get_download_url(job_id, "transcript.txt")
-    except RuntimeError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return RedirectResponse(url, status_code=302)
+    return _redirect_output_or_404(job_id, "transcript.txt")
 
 
 @router.get("/jobs/{job_id}/srt")

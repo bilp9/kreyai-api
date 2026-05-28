@@ -18,7 +18,7 @@ def test_ops_dashboard_returns_summary_and_jobs(monkeypatch):
     monkeypatch.setattr(
         ops_routes,
         "list_recent_jobs",
-        lambda limit=25, status=None, language=None, email_query=None: [
+        lambda limit=25, status=None, language=None, email_query=None, created_from=None, created_to=None: [
             {
                 "job_id": "KR-001",
                 "email": "a@example.com",
@@ -63,6 +63,16 @@ def test_ops_dashboard_returns_summary_and_jobs(monkeypatch):
             "expired": 1,
         }[status],
     )
+    monkeypatch.setattr(
+        ops_routes,
+        "count_jobs_by_field",
+        lambda field_name, value: 0,
+    )
+    monkeypatch.setattr(
+        ops_routes,
+        "_storage_exists_for_job",
+        lambda job_id: False,
+    )
 
     client = TestClient(app)
     res = client.get("/ops/dashboard")
@@ -75,6 +85,8 @@ def test_ops_dashboard_returns_summary_and_jobs(monkeypatch):
         "status": None,
         "language": None,
         "email": None,
+        "date_from": None,
+        "date_to": None,
     }
     assert body["summary"]["recent_jobs_count"] == 2
     assert body["summary"]["recent_completed_jobs"] == 1
@@ -94,21 +106,26 @@ def test_ops_dashboard_respects_limit(monkeypatch):
 
     observed = {}
 
-    def fake_list_recent_jobs(limit=25, status=None, language=None, email_query=None):
+    def fake_list_recent_jobs(limit=25, status=None, language=None, email_query=None, created_from=None, created_to=None):
         observed["limit"] = limit
         observed["status"] = status
         observed["language"] = language
         observed["email_query"] = email_query
+        observed["created_from"] = created_from
+        observed["created_to"] = created_to
         return []
 
     monkeypatch.setattr(ops_routes, "list_recent_jobs", fake_list_recent_jobs)
     monkeypatch.setattr(ops_routes, "count_jobs_by_status", lambda status: 0)
+    monkeypatch.setattr(ops_routes, "count_jobs_by_field", lambda field_name, value: 0)
 
     client = TestClient(app)
     res = client.get("/ops/dashboard", params={"limit": 10})
 
     assert res.status_code == 200
     assert observed["limit"] == 10
+    assert observed["created_from"] is None
+    assert observed["created_to"] is None
 
 
 def test_ops_dashboard_passes_filters(monkeypatch):
@@ -118,15 +135,18 @@ def test_ops_dashboard_passes_filters(monkeypatch):
 
     observed = {}
 
-    def fake_list_recent_jobs(limit=25, status=None, language=None, email_query=None):
+    def fake_list_recent_jobs(limit=25, status=None, language=None, email_query=None, created_from=None, created_to=None):
         observed["limit"] = limit
         observed["status"] = status
         observed["language"] = language
         observed["email_query"] = email_query
+        observed["created_from"] = created_from
+        observed["created_to"] = created_to
         return []
 
     monkeypatch.setattr(ops_routes, "list_recent_jobs", fake_list_recent_jobs)
     monkeypatch.setattr(ops_routes, "count_jobs_by_status", lambda status: 0)
+    monkeypatch.setattr(ops_routes, "count_jobs_by_field", lambda field_name, value: 0)
 
     client = TestClient(app)
     res = client.get(
@@ -140,4 +160,37 @@ def test_ops_dashboard_passes_filters(monkeypatch):
         "status": "failed",
         "language": "ht",
         "email_query": "billy",
+        "created_from": None,
+        "created_to": None,
     }
+
+
+def test_ops_dashboard_passes_date_filters(monkeypatch):
+    app = FastAPI()
+    app.include_router(ops_routes.router)
+    app.dependency_overrides[get_current_user] = lambda: User(id="ops-user")
+
+    observed = {}
+
+    def fake_list_recent_jobs(limit=25, status=None, language=None, email_query=None, created_from=None, created_to=None):
+        observed["limit"] = limit
+        observed["status"] = status
+        observed["language"] = language
+        observed["email_query"] = email_query
+        observed["created_from"] = created_from
+        observed["created_to"] = created_to
+        return []
+
+    monkeypatch.setattr(ops_routes, "list_recent_jobs", fake_list_recent_jobs)
+    monkeypatch.setattr(ops_routes, "count_jobs_by_status", lambda status: 0)
+    monkeypatch.setattr(ops_routes, "count_jobs_by_field", lambda field_name, value: 0)
+
+    client = TestClient(app)
+    res = client.get(
+        "/ops/dashboard",
+        params={"date_from": "2026-04-01", "date_to": "2026-04-10"},
+    )
+
+    assert res.status_code == 200
+    assert observed["created_from"] == "2026-04-01T00:00:00+00:00"
+    assert observed["created_to"] == "2026-04-10T23:59:59.999999+00:00"

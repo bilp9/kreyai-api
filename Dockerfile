@@ -19,12 +19,10 @@ RUN pip install --no-cache-dir -U pip \
   && pip install --no-cache-dir -r requirements.txt \
   && pip install --no-cache-dir gunicorn
 
-# Pre-download Whisper Model
-RUN mkdir -p /app/models/base && \
-    wget -q https://huggingface.co/Systran/faster-whisper-base/resolve/main/model.bin -O /app/models/base/model.bin && \
-    wget -q https://huggingface.co/Systran/faster-whisper-base/resolve/main/config.json -O /app/models/base/config.json && \
-    wget -q https://huggingface.co/Systran/faster-whisper-base/resolve/main/vocabulary.txt -O /app/models/base/vocabulary.txt && \
-    wget -q https://huggingface.co/Systran/faster-whisper-base/resolve/main/tokenizer.json -O /app/models/base/tokenizer.json
+# Pre-download Whisper models using huggingface_hub for more reliable large-file fetches.
+RUN python -c "from huggingface_hub import snapshot_download; \
+snapshot_download(repo_id='Systran/faster-whisper-base', local_dir='/app/models/base', local_dir_use_symlinks=False); \
+snapshot_download(repo_id='Systran/faster-whisper-large-v3', local_dir='/app/models/large-v3', local_dir_use_symlinks=False)"
 
 # --- IMPROVED COPY STRATEGY ---
 # Copy everything into /app. This preserves the root package structure.
@@ -39,6 +37,7 @@ ENV PORT=8080
 ENV KREYAI_ENV=cloudrun
 ENV PYTHONPATH=/app
 ENV WHISPER_MODEL_PATH=/app/models/base
+ENV WHISPER_MODEL_PATH_HT=/app/models/large-v3
 ENV PYTHONUNBUFFERED=1
 ENV API_KEYS_FILE=/app/data/api_keys.json
 

@@ -15,11 +15,13 @@ from pathlib import Path
 
 from faster_whisper import WhisperModel
 from app.config import get_default_whisper_model_size
+from app.config_ht import HT_ENABLE_PROMPT, ht_use_thin_pipeline
 
 # -------------------------------------------------
 # Akademi
 # -------------------------------------------------
 from app.transcription.akademi_normalize import AkademiNormalizer
+from app.transcription.lexicon_store import load_learned_lexicon
 
 # -------------------------------------------------
 # Linguistic pipeline (HT-only)
@@ -33,10 +35,20 @@ from app.transcription.contextual import apply_contextual_corrections
 from app.transcription.lexical_correction import apply_lexical_corrections
 from app.transcription.technical import resolve_tech_phrases
 from app.transcription.formatting import apply_formatting
+from app.transcription.formatting_light import apply_light_formatting, minimal_postprocess_ht
+from app.transcription.code_switch import (
+    shield_code_switch_spans,
+    restore_code_switch_spans,
+    has_unrestored_code_switch_placeholders,
+)
 
 # Confidence / hallucination (HT-only gates; harmless to compute but we keep HT-only)
-from app.transcription.metrics import is_hallucinated
-from app.transcription.confidence import split_segments_by_confidence, is_low_confidence
+from app.transcription.metrics import is_hallucinated, is_known_subtitle_hallucination
+from app.transcription.confidence import (
+    split_segments_by_confidence,
+    is_low_confidence,
+    get_confidence_tier,
+)
 
 # Observability
 from app.transcription.observability import PipelineMetrics
@@ -76,6 +88,8 @@ def _load_akademi() -> Optional[AkademiNormalizer]:
         return None
 
     lexicon = json.loads(path.read_text(encoding="utf-8"))
+    for word in load_learned_lexicon():
+        lexicon.setdefault(word, 1.0)
     _AKADEMI = AkademiNormalizer(lexicon)
     return _AKADEMI
 
@@ -86,7 +100,10 @@ def _load_akademi() -> Optional[AkademiNormalizer]:
 # Disabled by default because long instruction-style prompts can leak
 # into the transcript itself on lower-confidence runs. If we want to
 # experiment with prompting again, keep it short and bias-only.
-HT_DECODING_PROMPT = "Kreyol Ayisyen, pa tradui, kenbe mo angle ak franse yo."
+HT_DECODING_PROMPT = (
+    "Haitian Creole transcription only; no translation; keep French/English code-switching; "
+    "no invented words; standard Haitian Creole spelling."
+)
 
 
 # -------------------------------------------------
@@ -113,6 +130,7 @@ class TranscriptionConfig:
     language: str = "en"
 
     beam_size: int = 5
+    best_of: int = 5
     temperature: float = 0.0
     vad_filter: bool = True
     condition_on_previous_text: bool = False
@@ -128,9 +146,9 @@ class TranscriptionConfig:
 
 
 # -------------------------------------------------
-# Whisper model singleton
+# Whisper model cache
 # -------------------------------------------------
-_MODEL: Optional[WhisperModel] = None
+_MODELS: Dict[str, WhisperModel] = {}
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -140,6 +158,57 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _optional_bool_env(name: str) -> Optional[bool]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _int_env(name: str) -> Optional[int]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return None
+
+
+def _float_env(name: str) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return None
+
+
+def _temperature_env(name: str) -> Optional[Any]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+
+    value = raw.strip()
+    if "," in value:
+        temps = []
+        for item in value.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                temps.append(float(item))
+            except ValueError:
+                return None
+        return temps or None
+
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
 def _promotion_writes_enabled(explicit: Optional[bool] = None) -> bool:
     if explicit is not None:
         return explicit
@@ -147,12 +216,74 @@ def _promotion_writes_enabled(explicit: Optional[bool] = None) -> bool:
 
 
 def _ht_decoder_prompt() -> Optional[str]:
+    if not HT_ENABLE_PROMPT:
+        return None
     if not _bool_env("KREYAI_HT_USE_DECODER_PROMPT", default=False):
         return None
     prompt = os.getenv("KREYAI_HT_DECODER_PROMPT", "").strip()
     if prompt:
         return prompt
     return HT_DECODING_PROMPT
+
+
+def _apply_ht_decode_overrides(cfg: TranscriptionConfig) -> TranscriptionConfig:
+    if cfg.language != "ht":
+        return cfg
+
+    # HT test runs were noticeably better with raw Whisper behavior. Faster
+    # Whisper's VAD and the generic no-speech threshold can drop soft/overlapped
+    # Creole speech, so default HT to model-side segmentation and a less
+    # aggressive no-speech gate unless an experiment explicitly overrides them.
+    updates: Dict[str, Any] = {
+        "vad_filter": False,
+    }
+
+    beam_size = _int_env("KREYAI_HT_BEAM_SIZE")
+    if beam_size is not None:
+        updates["beam_size"] = beam_size
+
+    best_of = _int_env("KREYAI_HT_BEST_OF")
+    if best_of is not None:
+        updates["best_of"] = best_of
+
+    temperature = _temperature_env("KREYAI_HT_TEMPERATURE")
+    if temperature is not None:
+        updates["temperature"] = temperature
+
+    no_speech_threshold = _float_env("KREYAI_HT_NO_SPEECH_THRESHOLD")
+    if no_speech_threshold is not None:
+        updates["no_speech_threshold"] = no_speech_threshold
+
+    log_prob_threshold = _float_env("KREYAI_HT_LOG_PROB_THRESHOLD")
+    if log_prob_threshold is not None:
+        updates["log_prob_threshold"] = log_prob_threshold
+
+    compression_ratio_threshold = _float_env("KREYAI_HT_COMPRESSION_RATIO_THRESHOLD")
+    if compression_ratio_threshold is not None:
+        updates["compression_ratio_threshold"] = compression_ratio_threshold
+
+    repetition_penalty = _float_env("KREYAI_HT_REPETITION_PENALTY")
+    if repetition_penalty is not None:
+        updates["repetition_penalty"] = repetition_penalty
+
+    no_repeat_ngram_size = _int_env("KREYAI_HT_NO_REPEAT_NGRAM_SIZE")
+    if no_repeat_ngram_size is not None:
+        updates["no_repeat_ngram_size"] = no_repeat_ngram_size
+
+    condition_on_previous_text = os.getenv("KREYAI_HT_CONDITION_ON_PREVIOUS_TEXT")
+    if condition_on_previous_text is not None and condition_on_previous_text.strip():
+        updates["condition_on_previous_text"] = (
+            condition_on_previous_text.strip().lower() in {"1", "true", "yes", "on"}
+        )
+
+    vad_filter = _optional_bool_env("KREYAI_HT_VAD_FILTER")
+    if vad_filter is not None:
+        updates["vad_filter"] = vad_filter
+
+    if not updates:
+        return cfg
+
+    return replace(cfg, **updates)
 
 
 def _eval_dataset_id() -> Optional[str]:
@@ -217,16 +348,30 @@ def normalize_language_code(language: Optional[str]) -> Optional[str]:
     return normalized
 
 
+def _resolve_model_path(cfg: TranscriptionConfig) -> str:
+    if cfg.language == "ht":
+        return (
+            os.getenv("WHISPER_MODEL_PATH_HT")
+            or os.getenv("WHISPER_MODEL_SIZE_HT")
+            or "large-v3"
+        )
+
+    return os.getenv("WHISPER_MODEL_PATH") or os.getenv("WHISPER_MODEL_SIZE") or cfg.model_size
+
+
 def _get_model(cfg: TranscriptionConfig) -> WhisperModel:
-    global _MODEL
-    if _MODEL is None:
-        model_path = os.getenv("WHISPER_MODEL_PATH") or os.getenv("WHISPER_MODEL_SIZE") or cfg.model_size
-        _MODEL = WhisperModel(
+    model_path = _resolve_model_path(cfg)
+    cache_key = f"{model_path}|{cfg.device}|{cfg.compute_type}"
+
+    model = _MODELS.get(cache_key)
+    if model is None:
+        model = WhisperModel(
             model_path,
             device=cfg.device,
             compute_type=cfg.compute_type,
         )
-    return _MODEL
+        _MODELS[cache_key] = model
+    return model
 
 
 def _speaker_gate(ht_density: float) -> str:
@@ -244,6 +389,100 @@ def _window_gate(metrics: Dict[str, Any]) -> str:
     if ht < WINDOW_FULL_A3:
         return "restricted"
     return "full"
+
+
+def _refine_ht_segment_second_pass(
+    text: str,
+    *,
+    confidence: Optional[float],
+    confidence_tier: str,
+    akademi: Optional[AkademiNormalizer],
+) -> str:
+    """
+    Conservative HT-only second pass.
+
+    Goals:
+    - touch only low-confidence segments
+    - be more assertive on `low`
+    - stay extra conservative on `review`
+    """
+
+    refined = text
+
+    if confidence_tier not in {"low", "review"}:
+        return refined
+
+    refined, code_switch_replacements = shield_code_switch_spans(refined)
+
+    if akademi:
+        refined = akademi.normalize_text(refined)
+
+    refined, _ = expand_contractions(refined)
+    refined, _ = normalize_dialect_variants(refined)
+
+    if confidence_tier == "low":
+        refined, _ = normalize_creole(refined, a3_mode="restricted", metrics=None)
+        refined, _ = apply_lexical_bias(refined)
+        refined, _ = normalize_verb_phrases(refined)
+        refined, _ = normalize_pronoun_tma(refined)
+        refined, _ = apply_contextual_corrections(refined, confidence=confidence)
+        refined, _ = apply_lexical_corrections(refined)
+    else:
+        # `review` segments are the riskiest: bias toward orthography cleanup only.
+        refined, _ = normalize_creole(refined, a3_mode="none", metrics=None)
+        refined, _ = apply_contextual_corrections(refined, confidence=confidence)
+
+    if akademi:
+        refined = akademi.normalize_text(refined)
+
+    return restore_code_switch_spans(refined, code_switch_replacements)
+
+
+def transcribe_ht_raw(
+    *,
+    raw_segments: List[Dict[str, Any]],
+    segments_list: List[Dict[str, Any]],
+    effective_language: str,
+    normalized_language: Optional[str],
+    detected_language: Optional[str],
+    debug: bool,
+) -> Dict[str, Any]:
+    filtered_raw_segments: List[Dict[str, Any]] = []
+    filtered_segments_list: List[Dict[str, Any]] = []
+
+    for raw_segment, segment in zip(raw_segments, segments_list):
+        if is_known_subtitle_hallucination(raw_segment.get("text") or ""):
+            continue
+        filtered_raw_segments.append(raw_segment)
+        filtered_segment = dict(segment)
+        filtered_segment["text"] = apply_light_formatting(raw_segment["text"], language="ht")
+        filtered_segments_list.append(filtered_segment)
+
+    joined = " ".join(seg["text"] for seg in filtered_raw_segments)
+    final_text = minimal_postprocess_ht(joined).strip()
+
+    if has_unrestored_code_switch_placeholders(final_text):
+        raise ValueError("Unrestored code-switch placeholder detected in HT transcript")
+
+    debug_payload = (
+        {
+            "language": effective_language,
+            "language_requested": normalized_language or "auto",
+            "language_detected": detected_language,
+            "pipeline_mode": "thin",
+        }
+        if debug
+        else None
+    )
+
+    return {
+        "text": final_text,
+        "segments": filtered_segments_list,
+        "language": effective_language,
+        "language_requested": normalized_language or "auto",
+        "language_detected": detected_language,
+        "debug": debug_payload,
+    }
 
 
 # -------------------------------------------------
@@ -277,6 +516,7 @@ def transcribe_audio(
     normalized_language = normalize_language_code(language)
     if normalized_language:
         cfg = replace(cfg, language=normalized_language)
+    cfg = _apply_ht_decode_overrides(cfg)
     engine_language = normalized_language or None
 
     def _progress(pct: int, msg: str):
@@ -300,6 +540,7 @@ def transcribe_audio(
         language=engine_language,
         task="transcribe", #enforcing transcription over translation 
         beam_size=cfg.beam_size,
+        best_of=cfg.best_of,
         temperature=cfg.temperature,
         vad_filter=cfg.vad_filter,
         condition_on_previous_text=cfg.condition_on_previous_text,
@@ -349,6 +590,7 @@ def transcribe_audio(
                 "raw_text": text,
                 "text": text,
                 "avg_logprob": getattr(seg, "avg_logprob", None),
+                "no_speech_prob": getattr(seg, "no_speech_prob", None),
                 "hallucinated": bool(is_hallucinated(text)),
             }
         )
@@ -368,6 +610,7 @@ def transcribe_audio(
             "raw_text": seg["raw_text"],
             "text": seg["text"],
             "avg_logprob": seg["avg_logprob"],
+            "no_speech_prob": seg.get("no_speech_prob"),
             "hallucinated": seg["hallucinated"],
         }
         for seg in raw_segments
@@ -394,7 +637,7 @@ def transcribe_audio(
     if not is_ht_run:
         _progress(75, "Basic formatting")
         joined = " ".join(seg["text"] for seg in raw_segments)
-        final_text = apply_formatting(joined).strip()
+        final_text = apply_formatting(joined, language=effective_language).strip()
 
         for i in range(min(len(segments_list), len(raw_segments))):
             segments_list[i]["text"] = raw_segments[i]["text"]
@@ -412,10 +655,20 @@ def transcribe_audio(
     # =================================================
     # HT: Full KreyAI enhancement pipeline
     # =================================================
+    if ht_use_thin_pipeline():
+        return transcribe_ht_raw(
+            raw_segments=raw_segments,
+            segments_list=segments_list,
+            effective_language=effective_language,
+            normalized_language=normalized_language,
+            detected_language=detected_language,
+            debug=debug,
+        )
 
     _progress(35, "Post-processing (confidence gates)")
     split_segments_by_confidence(raw_segments)
     for seg in raw_segments:
+        seg["confidence_tier"] = get_confidence_tier(seg)
         seg["low_confidence"] = is_low_confidence(seg)
 
     _progress(45, "Computing HT density")
@@ -432,6 +685,7 @@ def transcribe_audio(
     for seg in raw_segments:
         text = seg["text"]
         confidence = seg.get("avg_logprob")
+        text, code_switch_replacements = shield_code_switch_spans(text)
 
         # Akademi normalization (early)
         if akademi:
@@ -454,7 +708,7 @@ def transcribe_audio(
         if ak:
             text = ak.normalize_text(text)
 
-        seg["text"] = text
+        seg["text"] = restore_code_switch_spans(text, code_switch_replacements)
 
     _progress(75, "A3 window corrections")
     window = deque(maxlen=cfg.a3_window_segments)
@@ -501,10 +755,28 @@ def transcribe_audio(
     if promo_db is not None:
         save_promotion_db(promo_db)
 
+    _progress(84, "Second-pass refinement")
+    second_pass_segments = 0
+    for seg in raw_segments:
+        confidence_tier = str(seg.get("confidence_tier") or "medium")
+        if confidence_tier not in {"low", "review"}:
+            continue
+
+        before = seg["text"]
+        after = _refine_ht_segment_second_pass(
+            before,
+            confidence=seg.get("avg_logprob"),
+            confidence_tier=confidence_tier,
+            akademi=akademi,
+        )
+        if after != before:
+            seg["text"] = after
+        second_pass_segments += 1
+
     _progress(88, "Formatting output")
     joined = " ".join(seg["text"] for seg in raw_segments)
     joined, _ = resolve_tech_phrases(joined, confidence=None)
-    final_text = apply_formatting(joined).strip()
+    final_text = apply_formatting(joined, language=effective_language).strip()
 
     # Keep timestamps but replace per-segment text with cleaned version
     for i in range(min(len(segments_list), len(raw_segments))):
@@ -530,6 +802,7 @@ def transcribe_audio(
             "promotion_writes_enabled": promotion_writes_enabled,
             "a3_events_total": len(a3_events),
             "a3_reversals_total": len(reversed_events),
+            "second_pass_segments_total": second_pass_segments,
             "pipeline_metrics": metrics.snapshot(),
         }
         if debug
@@ -551,6 +824,7 @@ def transcribe_audio(
                         "segment_index": seg["segment_index"],
                         "text": seg["text"],
                         "ht_density_raw": seg.get("ht_density_raw"),
+                        "confidence_tier": seg.get("confidence_tier"),
                         "low_confidence": seg.get("low_confidence"),
                     }
                     for seg in raw_segments

@@ -3,7 +3,7 @@ from typing import Tuple
 
 
 DEFAULT_PUBLIC_API_VERSION = "2.0.0"
-DEFAULT_PUBLIC_LANGUAGES = ("auto", "en", "es", "fr", "pt")
+DEFAULT_PUBLIC_LANGUAGES = ("auto", "en", "ht", "es", "fr", "pt")
 LANGUAGE_LABELS = {
     "auto": "Auto Detect",
     "en": "English",

@@ -88,14 +88,26 @@ def test_list_recent_jobs_filters_locally(monkeypatch):
     ]
 
     class _OrderedQuery:
+        def where(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
         def limit(self, value):
             assert value == 100
+            return self
+
+        def start_after(self, doc):
             return self
 
         def stream(self):
             return iter(docs)
 
     class _Collection:
+        def where(self, *args, **kwargs):
+            return _OrderedQuery()
+
         def order_by(self, *args, **kwargs):
             return _OrderedQuery()
 

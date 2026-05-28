@@ -2,8 +2,10 @@
 
 import os
 import httpx
+from urllib.parse import urlencode
 
 from app.constants import VERIFICATION_CODE_TTL_MINUTES
+from app.security.job_tokens import JobTokenConfig, mint_job_token
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000")
@@ -86,9 +88,10 @@ async def _send_emails(to_emails: list[str], subject: str, html: str):
 
 async def send_verification_email(to_email: str, job_id: str, code: str):
 
+    query = urlencode({"job": job_id, "email": to_email, "code": code})
     verification_link = (
         f"{FRONTEND_BASE_URL}/verify"
-        f"?job={job_id}&email={to_email}&code={code}"
+        f"?{query}"
     )
 
     html_content = f"""
@@ -126,11 +129,21 @@ async def send_verification_email(to_email: str, job_id: str, code: str):
         html_content,
     )
 
+
+def _build_job_access_link(job_id: str) -> str | None:
+    secret = os.getenv("JOB_TOKEN_SECRET", "")
+    if len(secret) < 16:
+        return None
+
+    ttl = int(os.getenv("JOB_TOKEN_TTL_SECONDS", str(7 * 24 * 3600)))
+    token = mint_job_token(JobTokenConfig(secret=secret, ttl_seconds=ttl), job_id=job_id)
+    return f"{FRONTEND_BASE_URL}/jobs/{job_id}?t={token}"
+
 # -------------------------------------------------
 # Completion Email
 # -------------------------------------------------
 
-async def send_completion_email(email: str, job_id: str):
+async def send_completion_email(email: str, job_id: str, *, language: str | None = None):
     from app.storage.backend import get_storage
 
     storage = get_storage()
@@ -140,6 +153,16 @@ async def send_completion_email(email: str, job_id: str):
     srt = storage.get_download_url(job_id, "transcript.srt")
     vtt = storage.get_download_url(job_id, "transcript.vtt")
     html = storage.get_download_url(job_id, "transcript.html")
+    job_page_link = _build_job_access_link(job_id)
+
+    job_page_section = ""
+    if job_page_link:
+        job_page_section = f"""
+      <p>
+        You can also reopen your job page here:
+        <a href="{job_page_link}">View job page</a>
+      </p>
+        """
 
     html_content = f"""
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.6; color:#111;">
@@ -156,6 +179,8 @@ async def send_completion_email(email: str, job_id: str):
         <li><a href="{vtt}">Download VTT</a></li>
         <li><a href="{html}">Download HTML (Podcast / Website)</a></li>
       </ul>
+
+      {job_page_section}
 
       <p style="font-size:13px; color:#777;">
         These download links remain available for 7 days.
@@ -182,6 +207,40 @@ async def send_completion_email(email: str, job_id: str):
     await _send_email(
         email,
         f"Your KreyAI transcription is ready — {job_id}",
+        html_content,
+    )
+
+
+async def send_job_access_email(email: str, job_id: str):
+    job_page_link = _build_job_access_link(job_id)
+    if not job_page_link:
+        print("⚠️ JOB_TOKEN_SECRET not set — skipping job access email")
+        return
+
+    html_content = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.6; color:#111;">
+      <h2>Your KreyAI job link</h2>
+
+      <p>Use the link below to reopen your job page for <strong>{job_id}</strong>.</p>
+
+      <p>
+        <a href="{job_page_link}"
+           style="background:#111; color:#fff; padding:12px 20px;
+                  text-decoration:none; border-radius:6px;
+                  font-weight:500; display:inline-block;">
+          Open job page
+        </a>
+      </p>
+
+      <p style="font-size:13px; color:#777;">
+        This link expires automatically based on your job access token settings.
+      </p>
+    </div>
+    """
+
+    await _send_email(
+        email,
+        f"Your KreyAI job link — {job_id}",
         html_content,
     )
 
@@ -218,7 +277,7 @@ async def send_credit_purchase_confirmation_email(
 
       <p>
         You can review your balance any time on the
-        <a href="{FRONTEND_BASE_URL}/billing?email={email}">billing page</a>.
+        <a href="{billing_url}">billing page</a>.
       </p>
 
       <p>Thank you for using KreyAI.</p>

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional
+from urllib.parse import urlencode
 
 import stripe
 
@@ -90,15 +91,25 @@ def create_checkout_session(
 
     pack = get_credit_pack(pack_id)
     normalized_email = normalize_billing_email(email)
-    success_url = (
-        f"{_frontend_base_url()}/billing"
-        f"?success=1&session_id={{CHECKOUT_SESSION_ID}}&email={normalized_email}&pack={pack.id}"
-    )
+    success_params = {
+        "success": "1",
+        "session_id": "{CHECKOUT_SESSION_ID}",
+        "email": normalized_email,
+        "pack": pack.id,
+    }
+    cancel_params = {
+        "canceled": "1",
+        "email": normalized_email,
+        "pack": pack.id,
+    }
     if job_id and job_token:
-        success_url += f"&job={job_id}&t={job_token}"
-    cancel_url = f"{_frontend_base_url()}/billing?canceled=1&email={normalized_email}&pack={pack.id}"
-    if job_id and job_token:
-        cancel_url += f"&job={job_id}&t={job_token}"
+        success_params["job"] = job_id
+        success_params["t"] = job_token
+        cancel_params["job"] = job_id
+        cancel_params["t"] = job_token
+
+    success_url = f"{_frontend_base_url()}/billing?{urlencode(success_params)}"
+    cancel_url = f"{_frontend_base_url()}/billing?{urlencode(cancel_params)}"
 
     session = stripe.checkout.Session.create(
         mode="payment",

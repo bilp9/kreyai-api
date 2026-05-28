@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.routes import jobs as jobs_routes
+from app.services.access_control import AccessDecision
 
 
 class FakeStorage:
@@ -28,8 +29,25 @@ class FakeStorage:
 
 
 @pytest.fixture(autouse=True)
-def reset_public_rate_limits():
+def isolate_job_route_dependencies(monkeypatch):
     jobs_routes._PUBLIC_RATE_LIMITS.clear()
+    monkeypatch.setattr(
+        jobs_routes,
+        "resolve_submission_access",
+        lambda email, audio_duration_seconds=None: AccessDecision(
+            allowed=True,
+            source="credits",
+            reason="credits_unenforced",
+            credits_to_deduct=1,
+            billable_minutes=1,
+            requires_credit_check=True,
+        ),
+    )
+    monkeypatch.setattr(
+        jobs_routes,
+        "_probe_uploaded_audio_duration_seconds",
+        lambda file_path: 60.0,
+    )
     yield
     jobs_routes._PUBLIC_RATE_LIMITS.clear()
 
@@ -75,7 +93,7 @@ def test_customer_job_flow(monkeypatch):
     monkeypatch.setattr(jobs_routes, "fs_update_job", update_job)
     monkeypatch.setattr(jobs_routes, "record_event", record_event)
     monkeypatch.setattr(jobs_routes, "get_events", get_events)
-    monkeypatch.setattr(jobs_routes, "dispatch_job", lambda job_id: dispatched.append(job_id))
+    monkeypatch.setattr(jobs_routes, "dispatch_job", lambda job_id, **kwargs: dispatched.append(job_id))
     monkeypatch.setattr(jobs_routes, "send_verification_email", send_verification_email)
     monkeypatch.setattr(jobs_routes, "get_storage", lambda: storage)
 
@@ -240,7 +258,11 @@ def test_finalize_upload_rolls_back_when_dispatch_fails(monkeypatch):
     monkeypatch.setattr(jobs_routes, "fs_update_job", lambda requested_job_id, updates: jobs[requested_job_id].update(dict(updates)))
     monkeypatch.setattr(jobs_routes, "record_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(jobs_routes, "get_storage", lambda: storage)
-    monkeypatch.setattr(jobs_routes, "dispatch_job", lambda requested_job_id: (_ for _ in ()).throw(RuntimeError("dispatch down")))
+    monkeypatch.setattr(
+        jobs_routes,
+        "dispatch_job",
+        lambda requested_job_id, **kwargs: (_ for _ in ()).throw(RuntimeError("dispatch down")),
+    )
 
     client = TestClient(app)
     token = jobs_routes.mint_job_token(jobs_routes._token_cfg(), job_id=job_id)
@@ -401,6 +423,7 @@ def test_public_config_hides_internal_only_languages_by_default(monkeypatch):
     assert res.json()["languages"] == [
         {"code": "auto", "label": "Auto Detect"},
         {"code": "en", "label": "English"},
+        {"code": "ht", "label": "Haitian Creole"},
         {"code": "es", "label": "Spanish"},
         {"code": "fr", "label": "French"},
         {"code": "pt", "label": "Portuguese"},

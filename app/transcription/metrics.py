@@ -7,6 +7,17 @@ from typing import Optional
 
 _APOSTROPHE_RUN = re.compile(r"(?:\b\w'\s*){2,}")
 _LOW_ALPHA = re.compile(r"[a-zA-Z]{2,}")
+_KNOWN_SUBTITLE_HALLUCINATIONS = (
+    "sous-titrage société radio-canada",
+    "sous titrage société radio-canada",
+    "sous-titrage radio-canada",
+    "sous titrage radio-canada",
+)
+
+
+def is_known_subtitle_hallucination(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").casefold()).strip()
+    return any(phrase in normalized for phrase in _KNOWN_SUBTITLE_HALLUCINATIONS)
 
 
 def is_hallucinated(text: str) -> bool:
@@ -22,6 +33,9 @@ def is_hallucinated(text: str) -> bool:
 
     # Repeated phoneme-like patterns
     if _APOSTROPHE_RUN.search(t):
+        return True
+
+    if is_known_subtitle_hallucination(t):
         return True
 
     # Not enough real letters

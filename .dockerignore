@@ -3,5 +3,6 @@ __pycache__
 .git
 .gitignore
 .env
+data/api_keys.json
 *.log
 .DS_Store

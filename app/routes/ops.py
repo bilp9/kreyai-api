@@ -1,24 +1,29 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from app.auth.auth import get_current_user
 from app.constants import JobStatus
 from app.models.user import User
 from app.services.access_control import resolve_submission_access, serialize_access_decision
 from app.services.credits import adjust_credit_minutes, ensure_starter_credit_grant, get_credit_account, list_credit_ledger
+from app.services.docx_export import build_docx_bytes
 from app.services.partner_plans import (
     get_partner_plan_status,
     grant_partner_plan,
     renew_partner_plan,
     revoke_partner_plan,
 )
+from app.storage.backend import get_storage
 from app.state.firestore_jobs import count_jobs_by_field, count_jobs_by_status, list_recent_jobs
+from app.state.firestore_jobs import get_job as fs_get_job, update_job as fs_update_job
+from app.services.ht_llm_review import DEFAULT_PROMPT
+from app.services.ht_review_jobs import run_ht_review_job, start_ht_review_job
 
 router = APIRouter(prefix="/ops", tags=["ops"])
 
@@ -33,6 +38,16 @@ class BillingAdjustmentRequest(BaseModel):
     action: str
     minutes: int
     notes: Optional[str] = None
+
+
+class HTReviewRunRequest(BaseModel):
+    model: Optional[str] = None
+    prompt: Optional[str] = None
+    glossary_terms: List[str] = Field(default_factory=list)
+
+
+class HTReviewApproveRequest(BaseModel):
+    approved_text: str
 
 
 def _normalize_email(email: str) -> str:
@@ -61,19 +76,133 @@ def _utcnow_compact() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
 
 
+def _parse_datetime(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _date_start_iso(value: str | None) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return datetime(
+        parsed.year,
+        parsed.month,
+        parsed.day,
+        0,
+        0,
+        0,
+        tzinfo=timezone.utc,
+    ).isoformat()
+
+
+def _date_end_iso(value: str | None) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return datetime(
+        parsed.year,
+        parsed.month,
+        parsed.day,
+        23,
+        59,
+        59,
+        999999,
+        tzinfo=timezone.utc,
+    ).isoformat()
+
+
+def _storage_exists_for_job(job_id: str) -> bool:
+    storage = get_storage()
+    return storage.prefix_exists(f"jobs/{job_id}/uploads/") or storage.prefix_exists(f"jobs/{job_id}/outputs/")
+
+
+def _read_optional_output_text(job_id: str, filename: str) -> str | None:
+    storage = get_storage()
+    if not storage.output_exists(job_id, filename):
+        return None
+    return storage.read_output_text(job_id, filename)
+
+
+def _serialize_retention(job: Dict[str, Any]) -> Dict[str, Any]:
+    completed_at = _parse_datetime(job.get("completed_at"))
+    files_deleted_at = str(job.get("files_deleted_at") or "").strip() or None
+    auto_deleted_at = str(job.get("auto_deleted_at") or "").strip() or None
+    deleted_blob_count = int(job.get("deleted_blob_count") or 0)
+    scheduled_delete_at = (
+        (completed_at + timedelta(days=7)).isoformat() if completed_at is not None else None
+    )
+    scheduled_delete_dt = _parse_datetime(scheduled_delete_at)
+    last_storage_check_at = datetime.now(timezone.utc).isoformat()
+    storage_objects_present = _storage_exists_for_job(str(job.get("job_id") or ""))
+    now = datetime.now(timezone.utc)
+
+    if files_deleted_at:
+        storage_status = "customer_deleted"
+        retention_source = "customer_request"
+    elif auto_deleted_at:
+        storage_status = "expired_deleted"
+        retention_source = "lifecycle_rule"
+    elif storage_objects_present:
+        storage_status = "available"
+        retention_source = "active"
+    elif scheduled_delete_dt and scheduled_delete_dt <= now:
+        storage_status = "expired_deleted"
+        retention_source = "lifecycle_rule_inferred"
+    elif completed_at is not None:
+        storage_status = "missing"
+        retention_source = "unknown"
+    else:
+        storage_status = "not_ready"
+        retention_source = "active"
+
+    return {
+        "scheduled_delete_at": scheduled_delete_at,
+        "auto_deleted_at": auto_deleted_at,
+        "files_deleted_at": files_deleted_at,
+        "deleted_blob_count": deleted_blob_count,
+        "storage_status": storage_status,
+        "storage_objects_present": storage_objects_present,
+        "last_storage_check_at": last_storage_check_at,
+        "retention_source": retention_source,
+    }
+
+
 @router.get("/dashboard")
 def get_ops_dashboard(
     limit: int = Query(25, ge=1, le=100),
     status: str | None = Query(None),
     language: str | None = Query(None),
     email: str | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
     user: User = Depends(get_current_user),
 ):
+    created_from = _date_start_iso(date_from)
+    created_to = _date_end_iso(date_to)
     jobs = list_recent_jobs(
         limit=limit,
         status=status,
         language=language,
         email_query=email,
+        created_from=created_from,
+        created_to=created_to,
     )
 
     completed_jobs = [
@@ -129,6 +258,8 @@ def get_ops_dashboard(
             "status": status,
             "language": language,
             "email": email,
+            "date_from": date_from,
+            "date_to": date_to,
         },
         "summary": {
             "recent_jobs_count": len(jobs),
@@ -156,8 +287,14 @@ def get_ops_dashboard(
                 "created_at": job.get("created_at"),
                 "updated_at": job.get("updated_at"),
                 "completed_at": job.get("completed_at"),
+                **_serialize_retention(job),
                 "audio_duration_seconds": _coerce_float(job.get("audio_duration_seconds")),
                 "processing_time_seconds": _coerce_float(job.get("processing_time_seconds")),
+                "download_time_seconds": _coerce_float(job.get("download_time_seconds")),
+                "diarization_time_seconds": _coerce_float(job.get("diarization_time_seconds")),
+                "transcription_time_seconds": _coerce_float(job.get("transcription_time_seconds")),
+                "alignment_time_seconds": _coerce_float(job.get("alignment_time_seconds")),
+                "output_time_seconds": _coerce_float(job.get("output_time_seconds")),
                 "estimated_cost_usd": _coerce_float(job.get("estimated_cost_usd")),
                 "realtime_factor": _coerce_float(job.get("realtime_factor")),
                 "attempts": int(job.get("attempts") or 0),
@@ -168,9 +305,150 @@ def get_ops_dashboard(
                 "worker_job_name": job.get("worker_job_name"),
                 "worker_job_region": job.get("worker_job_region"),
                 "routing_reason": job.get("routing_reason"),
+                "dispatch_error": job.get("dispatch_error"),
+                "diarization_status": job.get("diarization_status"),
+                "diarization_error": job.get("diarization_error"),
+                "diarization_segments_count": int(job.get("diarization_segments_count") or 0),
+                "speaker_labeled_segments_count": int(job.get("speaker_labeled_segments_count") or 0),
+                "content_type": job.get("content_type"),
+                "file_size_bytes": _coerce_float(job.get("file_size_bytes") or job.get("size_bytes")),
+                "ht_review_updated_at": job.get("ht_review_updated_at"),
+                "ht_review_model": job.get("ht_review_model"),
+                "ht_review_approved_at": job.get("ht_review_approved_at"),
             }
             for job in jobs
         ],
+    }
+
+
+@router.get("/jobs/{job_id}/ht-review")
+def get_ht_review_route(
+    job_id: str,
+    user: User = Depends(get_current_user),
+):
+    job = fs_get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    raw_text = _read_optional_output_text(job_id, "transcript.txt")
+    corrected_text = _read_optional_output_text(job_id, "transcript.llm-corrected.txt")
+    approved_text = _read_optional_output_text(job_id, "transcript.approved.txt")
+    review_meta_raw = _read_optional_output_text(job_id, "transcript.llm-review.json")
+
+    review_meta = None
+    if review_meta_raw:
+        try:
+            review_meta = __import__("json").loads(review_meta_raw)
+        except Exception:
+            review_meta = None
+
+    return {
+        "viewer": {
+            "id": user.id,
+            "email": user.email,
+        },
+        "job_id": job_id,
+        "language": job.get("language_final") or job.get("language") or job.get("language_requested"),
+        "status": job.get("status"),
+        "raw_text": raw_text,
+        "corrected_text": corrected_text,
+        "approved_text": approved_text,
+        "review_meta": review_meta,
+        "default_prompt": DEFAULT_PROMPT,
+        "ht_review_status": job.get("ht_review_status"),
+        "ht_review_error": job.get("ht_review_error"),
+        "ht_review_requested_at": job.get("ht_review_requested_at"),
+        "ht_review_glossary_terms": job.get("ht_review_glossary_terms") or [],
+    }
+
+
+@router.post("/jobs/{job_id}/ht-review/run")
+def run_ht_review_route(
+    job_id: str,
+    payload: HTReviewRunRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+):
+    job = fs_get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    language = str(job.get("language_final") or job.get("language") or "").strip().lower()
+    if language != "ht":
+        raise HTTPException(status_code=400, detail="LLM review is currently enabled for Haitian Creole jobs only.")
+
+    storage = get_storage()
+    if not storage.output_exists(job_id, "transcript.txt"):
+        raise HTTPException(status_code=404, detail="Raw transcript output is not available yet.")
+
+    start_result = start_ht_review_job(
+        job_id,
+        model=payload.model,
+        prompt=payload.prompt,
+        glossary_terms=payload.glossary_terms,
+    )
+    if start_result.get("queued"):
+        background_tasks.add_task(
+            run_ht_review_job,
+            job_id,
+            model=payload.model,
+            prompt=payload.prompt,
+            glossary_terms=payload.glossary_terms,
+        )
+
+    return {
+        "job_id": job_id,
+        "accepted": True,
+        "queued": bool(start_result.get("queued")),
+        "already_running": bool(start_result.get("already_running")),
+        "status": "running",
+        "message": (
+            "HT review is already running."
+            if start_result.get("already_running")
+            else "HT review started."
+        ),
+    }
+
+
+@router.post("/jobs/{job_id}/ht-review/approve")
+def approve_ht_review_route(
+    job_id: str,
+    payload: HTReviewApproveRequest,
+    user: User = Depends(get_current_user),
+):
+    job = fs_get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    approved_text = str(payload.approved_text or "").strip()
+    if not approved_text:
+        raise HTTPException(status_code=400, detail="approved_text is required.")
+
+    storage = get_storage()
+    storage.save_output(
+        job_id,
+        "transcript.approved.txt",
+        (approved_text + "\n").encode("utf-8"),
+        "text/plain; charset=utf-8",
+    )
+    storage.save_output(
+        job_id,
+        "transcript.approved.docx",
+        build_docx_bytes(approved_text),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+    fs_update_job(
+        job_id,
+        {
+            "ht_review_approved_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    return {
+        "job_id": job_id,
+        "approved": True,
     }
 
 

@@ -31,6 +31,13 @@ def load_lexicon() -> Set[str]:
     return base | learned
 
 
+def load_learned_lexicon() -> Set[str]:
+    """
+    Learned-only lexicon entries promoted from review.
+    """
+    return _read_words(LEARNED_LEXICON_PATH)
+
+
 def add_learned_word(word: str) -> None:
     w = word.strip().lower()
     if not w:

@@ -4,6 +4,7 @@ import json
 import subprocess
 import asyncio
 import os
+import re
 from datetime import datetime
 import time
 from html import escape
@@ -24,14 +25,23 @@ from app.constants import (
 
 from app.transcription.engine import transcribe_audio, normalize_language_code
 from app.transcription.formatting import apply_formatting
-from app.transcription.diarization import (
-    diarize_audio,
-    get_diarization_configuration_error,
-)
+from app.transcription.formatting_light import minimal_postprocess_ht
+from app.transcription.ht_cleanup_pipeline import run_ht_cleanup_pipeline
 from app.storage.backend import get_storage
 from app.events.recorder import record_event
-from app.processing.audio_preprocess import normalize_audio
+from app.processing.audio_preprocess import normalize_audio, preprocess_haitian_creole_audio
+from app.processing.dispatcher import dispatch_job
 from app.services.credits import refund_credit_minutes
+from app.config_ht import (
+    HT_ENABLE_DIARIZATION_LONG,
+    HT_ENABLE_DIARIZATION_SHORT,
+    HT_LONG_CHUNK_SECONDS,
+    HT_LONG_FORM_MINUTES,
+    HT_MAX_CHUNK_SECONDS,
+    HT_MEDIUM_CHUNK_SECONDS,
+    HT_MIN_CHUNK_SECONDS,
+    HT_RESUMABLE_MINUTES,
+)
 
 try:
     from app.services.email_service import send_completion_email
@@ -48,7 +58,61 @@ JOBS_COL = "jobs"
 # ---------------------------------------------------------
 CHUNK_IF_LONGER_THAN_SECONDS = 600  # 10 minutes
 CHUNK_SIZE_SECONDS = 300            # 5 minutes
+HT_CHUNK_IF_LONGER_THAN_SECONDS = int(os.getenv("KREYAI_HT_CHUNK_IF_LONGER_THAN_SECONDS", "600"))
+HT_CHUNK_MIN_SECONDS = HT_MIN_CHUNK_SECONDS
+HT_CHUNK_TARGET_SECONDS = HT_MEDIUM_CHUNK_SECONDS
+HT_CHUNK_MAX_SECONDS = HT_MAX_CHUNK_SECONDS
+HT_CHUNK_OVERLAP_SECONDS = 1.5
+HT_CHUNK_SILENCE_THRESHOLD_DB = -35
+HT_CHUNK_SILENCE_MIN_DURATION_SECONDS = 0.4
 PARAGRAPH_BREAK_THRESHOLD = 1.2
+HT_RESUME_IF_LONGER_THAN_SECONDS = HT_RESUMABLE_MINUTES * 60
+HT_RESUME_BUDGET_SECONDS = 42 * 60
+HT_LONG_CHUNK_MIN_SECONDS = max(HT_MIN_CHUNK_SECONDS, HT_LONG_CHUNK_SECONDS - 60)
+HT_LONG_CHUNK_TARGET_SECONDS = HT_LONG_CHUNK_SECONDS
+HT_LONG_CHUNK_MAX_SECONDS = HT_MAX_CHUNK_SECONDS
+HT_SHORT_FORM_MAX_SECONDS = HT_LONG_FORM_MINUTES * 60
+HT_MEDIUM_FORM_MAX_SECONDS = HT_RESUMABLE_MINUTES * 60
+HT_RESUME_MANIFEST_FILENAME = "ht_resume_manifest.json"
+HT_RESUME_RESULTS_FILENAME = "ht_resume_results.json"
+HT_RESUME_DIARIZATION_FILENAME = "ht_resume_diarization.json"
+
+SILENCE_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
+
+
+class HTResumeRequested(RuntimeError):
+    def __init__(self, *, next_chunk_index: int, total_chunks: int):
+        super().__init__("HT transcription continuation requested")
+        self.next_chunk_index = int(next_chunk_index)
+        self.total_chunks = int(total_chunks)
+
+
+def _transcription_timeout_seconds(
+    *,
+    language: str,
+    audio_duration_seconds: float,
+) -> int:
+    timeout_seconds = int(PROCESS_ATTEMPT_TIMEOUT_SECONDS)
+
+    if language != "ht":
+        return timeout_seconds
+
+    # Long HT runs use many silence-based chunks and can legitimately
+    # exceed the generic 30-minute budget even on healthy executions.
+    scaled_timeout = int((audio_duration_seconds * 1.25) + (10 * 60))
+    return max(timeout_seconds, min(scaled_timeout, 55 * 60))
+
+
+def _should_run_ht_diarization(
+    *,
+    duration_seconds: float,
+    requested: bool,
+) -> bool:
+    if not requested:
+        return False
+    if duration_seconds >= HT_SHORT_FORM_MAX_SECONDS:
+        return HT_ENABLE_DIARIZATION_LONG
+    return HT_ENABLE_DIARIZATION_SHORT
 
 
 # ---------------------------------------------------------
@@ -279,13 +343,22 @@ def _build_transcript_blocks(
     return blocks
 
 
-def _build_transcript_text(segments: List[Dict[str, Any]]) -> str:
+def _build_transcript_text(
+    segments: List[Dict[str, Any]],
+    *,
+    language: Optional[str] = None,
+) -> str:
 
     lines: List[str] = []
 
     for speaker, time_value, text in _build_transcript_blocks(segments):
         lines.append(f"{speaker} ({_format_hhmmss(time_value)})")
-        for paragraph in _split_transcript_paragraphs(text):
+        formatted_text = (
+            minimal_postprocess_ht(text)
+            if language == "ht"
+            else apply_formatting(text, language=language)
+        )
+        for paragraph in _split_transcript_paragraphs(formatted_text):
             lines.append(paragraph)
         lines.append("")
 
@@ -300,6 +373,7 @@ def _build_plain_paragraph_transcript(
     segments: List[Dict[str, Any]],
     *,
     paragraph_break_threshold: float = PARAGRAPH_BREAK_THRESHOLD,
+    language: Optional[str] = None,
 ) -> str:
 
     paragraphs: List[str] = []
@@ -323,7 +397,12 @@ def _build_plain_paragraph_transcript(
             and start_value is not None
             and (start_value - last_end) > paragraph_break_threshold
         ):
-            paragraph_text = apply_formatting(" ".join(current_paragraph)).strip()
+            joined_paragraph = " ".join(current_paragraph)
+            paragraph_text = (
+                minimal_postprocess_ht(joined_paragraph).strip()
+                if language == "ht"
+                else apply_formatting(joined_paragraph, language=language).strip()
+            )
             if paragraph_text:
                 paragraphs.append(paragraph_text)
             current_paragraph = [text]
@@ -334,7 +413,12 @@ def _build_plain_paragraph_transcript(
             last_end = end_value
 
     if current_paragraph:
-        paragraph_text = apply_formatting(" ".join(current_paragraph)).strip()
+        joined_paragraph = " ".join(current_paragraph)
+        paragraph_text = (
+            minimal_postprocess_ht(joined_paragraph).strip()
+            if language == "ht"
+            else apply_formatting(joined_paragraph, language=language).strip()
+        )
         if paragraph_text:
             paragraphs.append(paragraph_text)
 
@@ -423,18 +507,370 @@ def split_audio_into_chunks(file_path: str, chunk_seconds: int = CHUNK_SIZE_SECO
     return chunk_paths
 
 
-def cleanup_chunk_files(chunk_paths: List[str]) -> None:
+def _extract_audio_chunk(output_path: str, file_path: str, start_time: float, end_time: float) -> None:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{max(0.0, start_time):.3f}",
+        "-to",
+        f"{max(start_time, end_time):.3f}",
+        "-i",
+        file_path,
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def _detect_silence_endings(
+    file_path: str,
+    *,
+    noise_db: int = HT_CHUNK_SILENCE_THRESHOLD_DB,
+    min_silence_seconds: float = HT_CHUNK_SILENCE_MIN_DURATION_SECONDS,
+) -> List[float]:
+    cmd = [
+        "ffmpeg",
+        "-i",
+        file_path,
+        "-af",
+        f"silencedetect=noise={noise_db}dB:d={min_silence_seconds}",
+        "-f",
+        "null",
+        "-",
+    ]
+
+    completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    silence_ends: List[float] = []
+
+    for match in SILENCE_END_RE.finditer(completed.stderr or ""):
+        try:
+            silence_ends.append(float(match.group(1)))
+        except ValueError:
+            continue
+
+    return sorted(set(silence_ends))
+
+
+def build_silence_chunk_specs(
+    file_path: str,
+    *,
+    total_duration: float,
+    min_chunk_seconds: int = HT_CHUNK_MIN_SECONDS,
+    target_chunk_seconds: int = HT_CHUNK_TARGET_SECONDS,
+    max_chunk_seconds: int = HT_CHUNK_MAX_SECONDS,
+    overlap_seconds: float = HT_CHUNK_OVERLAP_SECONDS,
+    output_dir: str | None = None,
+) -> List[Dict[str, Any]]:
+    """
+    Split audio into HT-friendly chunks that prefer pause boundaries.
+    Each chunk keeps a small overlap, but also records the core keep window
+    so merged output does not duplicate overlap text.
+    """
+    chunk_dir = output_dir or f"{file_path}_ht_chunks"
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    silence_ends = _detect_silence_endings(file_path)
+    silence_ends = [value for value in silence_ends if 0.0 < value < total_duration]
+
+    boundaries = [0.0]
+    current = 0.0
+
+    while current < total_duration:
+        remaining = total_duration - current
+        if remaining <= max_chunk_seconds:
+            boundaries.append(total_duration)
+            break
+
+        window_start = current + min_chunk_seconds
+        window_end = min(total_duration, current + max_chunk_seconds)
+        candidates = [value for value in silence_ends if window_start <= value <= window_end]
+
+        if candidates:
+            cut_time = min(candidates, key=lambda value: abs(value - (current + target_chunk_seconds)))
+        else:
+            cut_time = window_end
+
+        if cut_time <= current:
+            cut_time = min(total_duration, current + max_chunk_seconds)
+
+        boundaries.append(cut_time)
+        current = cut_time
+
+    chunk_specs: List[Dict[str, Any]] = []
+
+    for index in range(len(boundaries) - 1):
+        keep_start = boundaries[index]
+        keep_end = boundaries[index + 1]
+        chunk_start = max(0.0, keep_start - overlap_seconds)
+        chunk_end = min(total_duration, keep_end + overlap_seconds)
+        output_path = os.path.join(chunk_dir, f"chunk_{index:03d}.wav")
+        _extract_audio_chunk(output_path, file_path, chunk_start, chunk_end)
+        chunk_specs.append(
+            {
+                "path": output_path,
+                "chunk_start": chunk_start,
+                "chunk_end": chunk_end,
+                "keep_start": keep_start,
+                "keep_end": keep_end,
+            }
+        )
+
+    if not chunk_specs:
+        raise RuntimeError("Silence-based chunking produced no output files")
+
+    return chunk_specs
+
+
+def split_audio_into_silence_chunks(
+    file_path: str,
+    *,
+    total_duration: float,
+    min_chunk_seconds: int = HT_CHUNK_MIN_SECONDS,
+    target_chunk_seconds: int = HT_CHUNK_TARGET_SECONDS,
+    max_chunk_seconds: int = HT_CHUNK_MAX_SECONDS,
+    overlap_seconds: float = HT_CHUNK_OVERLAP_SECONDS,
+) -> List[Dict[str, Any]]:
+    return build_silence_chunk_specs(
+        file_path,
+        total_duration=total_duration,
+        min_chunk_seconds=min_chunk_seconds,
+        target_chunk_seconds=target_chunk_seconds,
+        max_chunk_seconds=max_chunk_seconds,
+        overlap_seconds=overlap_seconds,
+    )
+
+
+def _ht_resume_enabled() -> bool:
+    return os.getenv("KREYAI_HT_RESUME_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _load_output_json(storage, job_id: str, filename: str) -> Any | None:
+    if not storage.output_exists(job_id, filename):
+        return None
+    raw = storage.read_output_text(job_id, filename)
+    if not raw.strip():
+        return None
+    return json.loads(raw)
+
+
+def _save_output_json(storage, job_id: str, filename: str, payload: Any) -> None:
+    storage.save_output_text(
+        job_id,
+        filename,
+        json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+        content_type="application/json; charset=utf-8",
+    )
+
+
+def _cleanup_ht_resume_outputs(storage, job_id: str) -> None:
+    for filename in (
+        HT_RESUME_MANIFEST_FILENAME,
+        HT_RESUME_RESULTS_FILENAME,
+        HT_RESUME_DIARIZATION_FILENAME,
+    ):
+        try:
+            storage.delete_output(job_id, filename)
+        except Exception:
+            pass
+
+
+def _persist_ht_resume_state(
+    doc_ref,
+    *,
+    next_chunk_index: int,
+    total_chunks: int,
+    last_completed_chunk_index: int | None,
+) -> None:
+    updates: Dict[str, Any] = {
+        "ht_resume_next_chunk_index": int(next_chunk_index),
+        "ht_resume_total_chunks": int(total_chunks),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    if last_completed_chunk_index is not None:
+        updates["ht_resume_last_completed_chunk_index"] = int(last_completed_chunk_index)
+    doc_ref.update(updates)
+
+
+def _clear_ht_resume_state(doc_ref) -> None:
+    doc_ref.update(
+        {
+            "ht_resume_next_chunk_index": firestore.DELETE_FIELD,
+            "ht_resume_total_chunks": firestore.DELETE_FIELD,
+            "ht_resume_last_completed_chunk_index": firestore.DELETE_FIELD,
+        }
+    )
+
+
+def _queue_ht_resume(
+    doc_ref,
+    job_id: str,
+    job: Dict[str, Any],
+    *,
+    next_chunk_index: int,
+    total_chunks: int,
+) -> None:
+    _persist_ht_resume_state(
+        doc_ref,
+        next_chunk_index=next_chunk_index,
+        total_chunks=total_chunks,
+        last_completed_chunk_index=max(-1, next_chunk_index - 1),
+    )
+    doc_ref.update(
+        {
+            "status": JobStatus.QUEUED.value,
+            "status_message": f"Continuing HT transcription in next worker pass ({next_chunk_index}/{total_chunks} chunks complete)",
+            "progress": 55 + int((max(0, min(total_chunks, next_chunk_index)) / max(1, total_chunks)) * 19),
+            "ht_resume_execution_count": firestore.Increment(1),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+    )
+    record_event(
+        job_id,
+        "requeued",
+        f"Continuing HT transcription from chunk {next_chunk_index + 1} of {total_chunks}",
+        JobStatus.QUEUED.value,
+    )
+    dispatch_job(
+        job_id,
+        worker_job_name=str(job.get("worker_job_name") or "kreyai-worker-gpu"),
+        worker_job_region=str(job.get("worker_job_region") or os.environ.get("CLOUD_RUN_REGION", "us-central1")),
+        execution_lane=str(job.get("execution_lane") or "gpu"),
+        requires_diarization=bool(job.get("requires_diarization")),
+    )
+
+
+async def transcribe_ht_with_resumable_chunking(
+    file_path: str,
+    *,
+    job_id: str,
+    storage,
+    doc_ref,
+    job: Dict[str, Any],
+    progress_cb=None,
+    budget_seconds: int = HT_RESUME_BUDGET_SECONDS,
+) -> Dict[str, Any]:
+
+    def emit_progress(pct: int, message: str) -> None:
+        if callable(progress_cb):
+            try:
+                progress_cb(int(pct), str(message))
+            except Exception:
+                pass
+
+    total_duration = get_audio_duration_seconds(file_path)
+    manifest = _load_output_json(storage, job_id, HT_RESUME_MANIFEST_FILENAME)
+    if not isinstance(manifest, list) or not manifest:
+        emit_progress(5, "Preparing resumable Haitian Creole chunks")
+        built_specs = build_silence_chunk_specs(
+            file_path,
+            total_duration=total_duration,
+            min_chunk_seconds=HT_LONG_CHUNK_MIN_SECONDS,
+            target_chunk_seconds=HT_LONG_CHUNK_TARGET_SECONDS,
+            max_chunk_seconds=HT_LONG_CHUNK_MAX_SECONDS,
+            output_dir=f"{file_path}_ht_manifest_chunks",
+        )
+        try:
+            manifest = [
+                {
+                    "chunk_start": float(spec["chunk_start"]),
+                    "chunk_end": float(spec["chunk_end"]),
+                    "keep_start": float(spec["keep_start"]),
+                    "keep_end": float(spec["keep_end"]),
+                }
+                for spec in built_specs
+            ]
+        finally:
+            cleanup_chunk_files(built_specs)
+        _save_output_json(storage, job_id, HT_RESUME_MANIFEST_FILENAME, manifest)
+
+    stored_results = _load_output_json(storage, job_id, HT_RESUME_RESULTS_FILENAME)
+    chunk_results: List[Dict[str, Any]] = stored_results if isinstance(stored_results, list) else []
+    total_chunks = max(1, len(manifest))
+    start_index = min(len(chunk_results), total_chunks)
+    _persist_ht_resume_state(
+        doc_ref,
+        next_chunk_index=start_index,
+        total_chunks=total_chunks,
+        last_completed_chunk_index=(start_index - 1) if start_index > 0 else None,
+    )
+
+    started_at = time.time()
+    materialized_chunk_specs: List[Dict[str, Any]] = []
+
+    try:
+        for index in range(start_index, total_chunks):
+            if index > start_index and (time.time() - started_at) >= budget_seconds:
+                _save_output_json(storage, job_id, HT_RESUME_RESULTS_FILENAME, chunk_results)
+                raise HTResumeRequested(next_chunk_index=index, total_chunks=total_chunks)
+
+            chunk_meta = manifest[index]
+            output_path = f"{file_path}_ht_resume_chunk_{index:03d}.wav"
+            _extract_audio_chunk(
+                output_path,
+                file_path,
+                float(chunk_meta["chunk_start"]),
+                float(chunk_meta["chunk_end"]),
+            )
+            materialized_chunk_specs.append({"path": output_path})
+
+            chunk_start = int((index / total_chunks) * 100)
+            chunk_end = int(((index + 1) / total_chunks) * 100)
+
+            def chunk_progress(pct: int, message: str) -> None:
+                scaled_pct = chunk_start + int((max(0, min(100, pct)) / 100) * (chunk_end - chunk_start))
+                emit_progress(
+                    scaled_pct,
+                    f"Transcribing HT chunk {index + 1}/{total_chunks}: {message}",
+                )
+
+            result = await asyncio.to_thread(
+                transcribe_audio,
+                output_path,
+                language="ht",
+                progress_cb=chunk_progress,
+            )
+            chunk_results.append(result)
+            _save_output_json(storage, job_id, HT_RESUME_RESULTS_FILENAME, chunk_results)
+            _persist_ht_resume_state(
+                doc_ref,
+                next_chunk_index=index + 1,
+                total_chunks=total_chunks,
+                last_completed_chunk_index=index,
+            )
+
+        _cleanup_ht_resume_outputs(storage, job_id)
+        return merge_chunk_results(chunk_results, manifest)
+    finally:
+        cleanup_chunk_files(materialized_chunk_specs)
+
+
+def cleanup_chunk_files(chunk_paths: List[str] | List[Dict[str, Any]]) -> None:
     if not chunk_paths:
         return
 
-    for path in chunk_paths:
+    normalized_paths = [
+        item.get("path") if isinstance(item, dict) else item
+        for item in chunk_paths
+    ]
+
+    for path in normalized_paths:
+        if not path:
+            continue
         try:
             if os.path.exists(path):
                 os.remove(path)
         except Exception:
             pass
 
-    chunk_dir = os.path.dirname(chunk_paths[0])
+    first_path = next((path for path in normalized_paths if path), None)
+    if not first_path:
+        return
+
+    chunk_dir = os.path.dirname(first_path)
     try:
         if os.path.isdir(chunk_dir) and not os.listdir(chunk_dir):
             os.rmdir(chunk_dir)
@@ -442,17 +878,17 @@ def cleanup_chunk_files(chunk_paths: List[str]) -> None:
         pass
 
 
-def merge_chunk_results(chunk_results: List[Dict[str, Any]], chunk_durations: List[float]) -> Dict[str, Any]:
+def merge_chunk_results(
+    chunk_results: List[Dict[str, Any]],
+    chunk_ranges: List[Dict[str, Any]],
+) -> Dict[str, Any]:
 
     merged_segments: List[Dict[str, Any]] = []
-    merged_text_parts: List[str] = []
     merged_language = None
     merged_detected_language = None
     merged_requested_language = None
 
-    offset = 0.0
-
-    for result, duration in zip(chunk_results, chunk_durations):
+    for result, chunk_range in zip(chunk_results, chunk_ranges):
         if merged_language is None:
             merged_language = result.get("language")
         if merged_detected_language is None:
@@ -460,11 +896,18 @@ def merge_chunk_results(chunk_results: List[Dict[str, Any]], chunk_durations: Li
         if merged_requested_language is None:
             merged_requested_language = result.get("language_requested")
 
-        chunk_text = (result.get("text") or "").strip()
-        if chunk_text:
-            merged_text_parts.append(chunk_text)
+        offset = float(chunk_range.get("chunk_start", 0.0))
+        keep_start = float(chunk_range.get("keep_start", offset))
+        keep_end = float(chunk_range.get("keep_end", chunk_range.get("chunk_end", offset)))
 
         for seg in _segments_from_result(result):
+            seg_start = float(seg.get("start", 0.0)) + offset
+            seg_end = float(seg.get("end", 0.0)) + offset
+            seg_midpoint = seg_start + ((seg_end - seg_start) / 2.0)
+
+            if seg_midpoint < keep_start or seg_midpoint > keep_end:
+                continue
+
             merged_words = []
             for word in seg.get("words") or []:
                 if not isinstance(word, dict):
@@ -472,33 +915,36 @@ def merge_chunk_results(chunk_results: List[Dict[str, Any]], chunk_durations: Li
 
                 word_start = word.get("start")
                 word_end = word.get("end")
+                absolute_word_start = float(word_start) + offset if word_start is not None else None
+                absolute_word_end = float(word_end) + offset if word_end is not None else None
+
+                if absolute_word_start is not None and absolute_word_end is not None:
+                    word_midpoint = absolute_word_start + ((absolute_word_end - absolute_word_start) / 2.0)
+                    if word_midpoint < keep_start or word_midpoint > keep_end:
+                        continue
 
                 merged_words.append(
                     {
                         **word,
-                        "start": (
-                            float(word_start) + offset
-                            if word_start is not None
-                            else None
-                        ),
-                        "end": (
-                            float(word_end) + offset
-                            if word_end is not None
-                            else None
-                        ),
+                        "start": absolute_word_start,
+                        "end": absolute_word_end,
                     }
                 )
 
             merged_segments.append(
                 {
-                    "start": float(seg.get("start", 0.0)) + offset,
-                    "end": float(seg.get("end", 0.0)) + offset,
+                    "start": seg_start,
+                    "end": seg_end,
                     "text": (seg.get("text") or "").strip(),
                     "words": merged_words,
                 }
             )
 
-        offset += duration
+    merged_text_parts = [
+        (seg.get("text") or "").strip()
+        for seg in merged_segments
+        if (seg.get("text") or "").strip()
+    ]
 
     return {
         "text": " ".join(merged_text_parts).strip(),
@@ -514,6 +960,10 @@ async def transcribe_with_optional_chunking(
     language: str,
     *,
     progress_cb=None,
+    storage=None,
+    job_id: str | None = None,
+    doc_ref=None,
+    job: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
 
     def emit_progress(pct: int, message: str) -> None:
@@ -524,6 +974,70 @@ async def transcribe_with_optional_chunking(
                 pass
 
     total_duration = get_audio_duration_seconds(file_path)
+
+    if (
+        language == "ht"
+        and total_duration > HT_RESUME_IF_LONGER_THAN_SECONDS
+        and _ht_resume_enabled()
+        and storage is not None
+        and job_id
+        and doc_ref is not None
+        and job is not None
+    ):
+        return await transcribe_ht_with_resumable_chunking(
+            file_path,
+            job_id=job_id,
+            storage=storage,
+            doc_ref=doc_ref,
+            job=job,
+            progress_cb=progress_cb,
+        )
+
+    if language == "ht" and total_duration > HT_CHUNK_IF_LONGER_THAN_SECONDS:
+        emit_progress(5, "Preparing silence-based Haitian Creole chunks")
+        if total_duration <= HT_SHORT_FORM_MAX_SECONDS:
+            target_seconds = HT_CHUNK_TARGET_SECONDS
+            min_seconds = max(45, min(HT_CHUNK_MIN_SECONDS, target_seconds))
+            max_seconds = min(180, HT_CHUNK_MAX_SECONDS)
+        else:
+            target_seconds = HT_MEDIUM_CHUNK_SECONDS
+            min_seconds = HT_MIN_CHUNK_SECONDS
+            max_seconds = min(HT_MAX_CHUNK_SECONDS, max(target_seconds + 60, HT_MEDIUM_CHUNK_SECONDS))
+
+        chunk_specs = split_audio_into_silence_chunks(
+            file_path,
+            total_duration=total_duration,
+            min_chunk_seconds=min_seconds,
+            target_chunk_seconds=target_seconds,
+            max_chunk_seconds=max_seconds,
+        )
+
+        try:
+            chunk_results: List[Dict[str, Any]] = []
+            total_chunks = max(1, len(chunk_specs))
+
+            for index, chunk_spec in enumerate(chunk_specs):
+                chunk_start = int((index / total_chunks) * 100)
+                chunk_end = int(((index + 1) / total_chunks) * 100)
+
+                def chunk_progress(pct: int, message: str) -> None:
+                    scaled_pct = chunk_start + int((max(0, min(100, pct)) / 100) * (chunk_end - chunk_start))
+                    emit_progress(
+                        scaled_pct,
+                        f"Transcribing HT chunk {index + 1}/{total_chunks}: {message}",
+                    )
+
+                result = await asyncio.to_thread(
+                    transcribe_audio,
+                    chunk_spec["path"],
+                    language=language,
+                    progress_cb=chunk_progress,
+                )
+                chunk_results.append(result)
+
+            return merge_chunk_results(chunk_results, chunk_specs)
+        finally:
+            cleanup_chunk_files(chunk_specs)
 
     if total_duration <= CHUNK_IF_LONGER_THAN_SECONDS:
         return await asyncio.to_thread(
@@ -543,14 +1057,23 @@ async def transcribe_with_optional_chunking(
     try:
 
         chunk_results: List[Dict[str, Any]] = []
-        chunk_durations: List[float] = []
+        chunk_ranges: List[Dict[str, Any]] = []
+        offset = 0.0
 
         total_chunks = max(1, len(chunk_paths))
 
         for index, chunk_path in enumerate(chunk_paths):
 
             duration = get_audio_duration_seconds(chunk_path)
-            chunk_durations.append(duration)
+            chunk_ranges.append(
+                {
+                    "chunk_start": offset,
+                    "chunk_end": offset + duration,
+                    "keep_start": offset,
+                    "keep_end": offset + duration,
+                }
+            )
+            offset += duration
 
             chunk_start = int((index / total_chunks) * 100)
             chunk_end = int(((index + 1) / total_chunks) * 100)
@@ -571,7 +1094,7 @@ async def transcribe_with_optional_chunking(
 
             chunk_results.append(result)
 
-        return merge_chunk_results(chunk_results, chunk_durations)
+        return merge_chunk_results(chunk_results, chunk_ranges)
 
     finally:
         cleanup_chunk_files(chunk_paths)
@@ -787,8 +1310,9 @@ async def run_job(job_id: str):
         )
 
     attempts = int(job.get("attempts") or 0)
+    resume_in_progress = int(job.get("ht_resume_next_chunk_index") or 0) > 0
 
-    if attempts >= PROCESS_MAX_ATTEMPTS:
+    if attempts >= PROCESS_MAX_ATTEMPTS and not resume_in_progress:
 
         doc_ref.update(
             {
@@ -800,18 +1324,22 @@ async def run_job(job_id: str):
 
         return
 
-    doc_ref.update(
-        {
-            "attempts": attempts + 1,
-            "status": JobStatus.PROCESSING.value,
-            "progress": max(progress, 5),
-            "status_message": "Starting",
-            "updated_at": datetime.utcnow().isoformat(),
-        }
-    )
+    start_updates: Dict[str, Any] = {
+        "status": JobStatus.PROCESSING.value,
+        "progress": max(progress, 5),
+        "status_message": "Starting" if not resume_in_progress else "Resuming HT transcription",
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    if not resume_in_progress:
+        start_updates["attempts"] = attempts + 1
+    else:
+        start_updates["ht_resume_execution_count"] = firestore.Increment(1)
+
+    doc_ref.update(start_updates)
     progress = max(progress, 5)
 
     local_path = None
+    processed_local_path = None
     diarization_input_path = None
 
     try:
@@ -849,57 +1377,25 @@ async def run_job(job_id: str):
         storage.download_to_file(source_blob, local_path)
         download_time_seconds = round(time.time() - download_start_time, 3)
 
-        # ---------------------------------------------------------
-        # Run speaker diarization before transcription when requested
-        # ---------------------------------------------------------
-        if requires_diarization:
-            update_progress(25, "Analyzing speakers")
-            diarization_config_error = get_diarization_configuration_error()
-            if diarization_config_error:
-                diarization_error_message = diarization_config_error
-                diarization_status = "misconfigured"
-                diarization_time_seconds = 0.0
-                print(
-                    "Skipping speaker diarization due to configuration issue:",
-                    diarization_error_message,
-                )
-            else:
-                try:
-                    print("Running speaker diarization...")
-                    diarization_start_time = time.time()
-                    diarization_input_path = await asyncio.to_thread(
-                        normalize_audio,
-                        local_path,
-                    )
-                    speaker_segments = await asyncio.to_thread(
-                        diarize_audio,
-                        diarization_input_path
-                    )
-                    diarization_time_seconds = round(time.time() - diarization_start_time, 3)
-                    print(f"Diarization segments detected: {len(speaker_segments)}")
-                    diarization_status = (
-                        "completed" if speaker_segments else "completed_empty"
-                    )
-                except Exception as diarization_error:
-                    diarization_time_seconds = round(time.time() - diarization_start_time, 3)
-                    print("Diarization failed but continuing transcription:", diarization_error)
-                    diarization_error_message = str(diarization_error)
-                    lowered_diarization_error = diarization_error_message.lower()
-                    if "hf_token" in lowered_diarization_error or "hugging face" in lowered_diarization_error:
-                        diarization_status = "misconfigured"
-                    else:
-                        diarization_status = "failed"
-                    speaker_segments = []
-        else:
-            diarization_status = "skipped"
-            diarization_time_seconds = 0.0
-        # ---------------------------------------------------------
+        processed_local_path = local_path
+        if requested_language == "ht":
+            update_progress(18, "Preprocessing Haitian Creole audio")
+            processed_local_path = await asyncio.to_thread(
+                preprocess_haitian_creole_audio,
+                local_path,
+            )
 
         if os.path.exists(local_path):
             file_size_bytes = os.path.getsize(local_path)
 
-        duration = get_audio_duration_seconds(local_path)
+        duration = get_audio_duration_seconds(processed_local_path)
         audio_duration_seconds = duration
+        effective_requires_diarization = requires_diarization
+        if requested_language == "ht":
+            effective_requires_diarization = _should_run_ht_diarization(
+                duration_seconds=duration,
+                requested=requires_diarization,
+            )
 
         print(f"Audio duration: {duration} seconds")
 
@@ -907,6 +1403,89 @@ async def run_job(job_id: str):
             raise RuntimeError(
                 f"Audio exceeds maximum allowed duration ({MAX_AUDIO_DURATION_SECONDS} seconds)"
             )
+
+        # ---------------------------------------------------------
+        # Run speaker diarization before transcription when requested
+        # ---------------------------------------------------------
+        ht_resume_diarization_eligible = (
+            requested_language == "ht"
+            and _ht_resume_enabled()
+            and effective_requires_diarization
+        )
+
+        if effective_requires_diarization:
+            from app.transcription.diarization import (
+                diarize_audio,
+                get_diarization_configuration_error,
+            )
+
+            update_progress(25, "Analyzing speakers")
+            cached_diarization = None
+            if ht_resume_diarization_eligible:
+                cached_diarization = _load_output_json(
+                    storage,
+                    job_id,
+                    HT_RESUME_DIARIZATION_FILENAME,
+                )
+
+            if isinstance(cached_diarization, list):
+                speaker_segments = cached_diarization
+                diarization_status = (
+                    "completed" if speaker_segments else "completed_empty"
+                )
+                diarization_time_seconds = 0.0
+                print(f"Reusing cached diarization segments: {len(speaker_segments)}")
+            else:
+                diarization_config_error = get_diarization_configuration_error()
+                if diarization_config_error:
+                    diarization_error_message = diarization_config_error
+                    diarization_status = "misconfigured"
+                    diarization_time_seconds = 0.0
+                    print(
+                        "Skipping speaker diarization due to configuration issue:",
+                        diarization_error_message,
+                    )
+                else:
+                    try:
+                        print("Running speaker diarization...")
+                        diarization_start_time = time.time()
+                        # Diarization needs a WAV-like audio stream even when
+                        # HT transcription intentionally uses the original
+                        # upload to avoid damaging ASR quality.
+                        diarization_input_path = await asyncio.to_thread(
+                            normalize_audio,
+                            local_path,
+                        )
+                        speaker_segments = await asyncio.to_thread(
+                            diarize_audio,
+                            diarization_input_path
+                        )
+                        diarization_time_seconds = round(time.time() - diarization_start_time, 3)
+                        print(f"Diarization segments detected: {len(speaker_segments)}")
+                        diarization_status = (
+                            "completed" if speaker_segments else "completed_empty"
+                        )
+                        if ht_resume_diarization_eligible:
+                            _save_output_json(
+                                storage,
+                                job_id,
+                                HT_RESUME_DIARIZATION_FILENAME,
+                                speaker_segments,
+                            )
+                    except Exception as diarization_error:
+                        diarization_time_seconds = round(time.time() - diarization_start_time, 3)
+                        print("Diarization failed but continuing transcription:", diarization_error)
+                        diarization_error_message = str(diarization_error)
+                        lowered_diarization_error = diarization_error_message.lower()
+                        if "hf_token" in lowered_diarization_error or "hugging face" in lowered_diarization_error:
+                            diarization_status = "misconfigured"
+                        else:
+                            diarization_status = "failed"
+                        speaker_segments = []
+        else:
+            diarization_status = "skipped"
+            diarization_time_seconds = 0.0
+        # ---------------------------------------------------------
 
         update_progress(55, "Transcribing audio")
         transcription_start_time = time.time()
@@ -916,13 +1495,27 @@ async def run_job(job_id: str):
             mapped_progress = 55 + int((bounded_progress / 100) * 19)
             update_progress(mapped_progress, message)
 
+        transcription_timeout_seconds = _transcription_timeout_seconds(
+            language=requested_language,
+            audio_duration_seconds=duration,
+        )
+        print(
+            "Transcription timeout budget:",
+            transcription_timeout_seconds,
+            "seconds",
+        )
+
         result = await asyncio.wait_for(
             transcribe_with_optional_chunking(
-                local_path,
+                processed_local_path,
                 language=requested_language,
                 progress_cb=transcription_progress,
+                storage=storage,
+                job_id=job_id,
+                doc_ref=doc_ref,
+                job=job,
             ),
-            timeout=PROCESS_ATTEMPT_TIMEOUT_SECONDS,
+            timeout=transcription_timeout_seconds,
         )
         transcription_time_seconds = round(time.time() - transcription_start_time, 3)
         final_language = result.get("language") or requested_language
@@ -930,7 +1523,7 @@ async def run_job(job_id: str):
 
         update_progress(75, "Preparing transcript")
         alignment_start_time = time.time()
-        if requires_diarization and speaker_segments:
+        if effective_requires_diarization and speaker_segments:
             align_speakers(result, speaker_segments)
         alignment_time_seconds = round(time.time() - alignment_start_time, 3)
         result["speaker_segments"] = speaker_segments
@@ -979,17 +1572,45 @@ async def run_job(job_id: str):
                 "diarization_error": diarization_error_message,
                 "diarization_segments_count": len(speaker_segments),
                 "speaker_labeled_segments_count": labeled_segments_count,
+                "requires_diarization": effective_requires_diarization,
+                "ht_resume_next_chunk_index": firestore.DELETE_FIELD,
+                "ht_resume_total_chunks": firestore.DELETE_FIELD,
+                "ht_resume_last_completed_chunk_index": firestore.DELETE_FIELD,
             }
         )
 
         if send_completion_email and job.get("email"):
 
             try:
-                await send_completion_email(job["email"], job_id)
+                await send_completion_email(
+                    job["email"],
+                    job_id,
+                    language=final_language,
+                )
             except Exception as e:
                 print("Email error", e)
 
-    except Exception as e:
+    except HTResumeRequested as resume_request:
+        try:
+            _queue_ht_resume(
+                doc_ref,
+                job_id,
+                job,
+                next_chunk_index=resume_request.next_chunk_index,
+                total_chunks=resume_request.total_chunks,
+            )
+        except Exception as dispatch_error:
+            failure_message = f"Failed to continue HT transcription: {dispatch_error}"
+            doc_ref.update(
+                {
+                    "status": JobStatus.FAILED.value,
+                    "status_message": failure_message,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            )
+            record_event(job_id, "failed", failure_message, JobStatus.FAILED.value)
+            raise
+    except BaseException as e:
         charged_minutes = int(job.get("credits_charged_minutes") or 0)
         if charged_minutes > 0:
             try:
@@ -1004,9 +1625,15 @@ async def run_job(job_id: str):
             except Exception as refund_error:
                 print(f"⚠️ Credit refund failed for {job_id}: {refund_error}")
 
+        failure_message = str(e) or e.__class__.__name__
+        if isinstance(e, asyncio.TimeoutError):
+            failure_message = "Transcription timed out"
+        elif isinstance(e, asyncio.CancelledError):
+            failure_message = "Transcription was cancelled"
+
         failure_update = {
             "status": JobStatus.FAILED.value,
-            "status_message": str(e),
+            "status_message": failure_message,
             "updated_at": datetime.utcnow().isoformat(),
         }
 
@@ -1049,12 +1676,22 @@ async def run_job(job_id: str):
 
         doc_ref.update(failure_update)
 
-        record_event(job_id, "failed", str(e), JobStatus.FAILED.value)
+        record_event(job_id, "failed", failure_message, JobStatus.FAILED.value)
+
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
 
     finally:
 
         if local_path and os.path.exists(local_path):
             os.remove(local_path)
+        if (
+            processed_local_path
+            and processed_local_path != local_path
+            and processed_local_path != diarization_input_path
+            and os.path.exists(processed_local_path)
+        ):
+            os.remove(processed_local_path)
         if diarization_input_path and os.path.exists(diarization_input_path):
             os.remove(diarization_input_path)
 
@@ -1151,6 +1788,7 @@ def _build_podcast_html(
     job_id: str,
     segments: List[Dict[str, Any]],
     diarization: Optional[Dict[str, Any]] = None,
+    language: Optional[str] = None,
 ) -> str:
     blocks = _build_transcript_blocks(segments)
     has_speaker_labels = _has_speaker_labels(segments)
@@ -1337,7 +1975,7 @@ def _build_podcast_html(
                 html.append(f"<p>{escape(paragraph)}</p>")
             html.append("</article>")
     else:
-        paragraph_text = _build_plain_paragraph_transcript(segments).strip()
+        paragraph_text = _build_plain_paragraph_transcript(segments, language=language).strip()
         for paragraph in paragraph_text.split("\n\n") if paragraph_text else []:
             html.append("<article class='block'>")
             html.append(f"<p>{escape(paragraph)}</p>")
@@ -1353,20 +1991,45 @@ def _build_podcast_html(
     return "\n".join(html)
 
 
+def _clean_ht_segments_for_output(segments: List[Dict[str, Any]], metadata: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    cleaned_segments: List[Dict[str, Any]] = []
+
+    for segment in segments:
+        cleaned_segment = dict(segment)
+        cleaned_segment["text"] = run_ht_cleanup_pipeline(
+            str(segment.get("text") or ""),
+            metadata=metadata,
+        )
+        cleaned_segments.append(cleaned_segment)
+
+    return cleaned_segments
+
+
 # ---------------------------------------------------------
 # Save Outputs
 # ---------------------------------------------------------
 def save_outputs(storage, job_id: str, result: Dict[str, Any]):
     text = (result.get("text") or "").strip()
+    language = result.get("language")
     segments = _segments_from_result(result)
     if segments:
         transcript_text = (
-            _build_transcript_text(segments)
+            _build_transcript_text(segments, language=language)
             if _has_speaker_labels(segments)
-            else _build_plain_paragraph_transcript(segments)
+            else _build_plain_paragraph_transcript(segments, language=language)
         )
     else:
-        transcript_text = (apply_formatting(text) + "\n") if text else ""
+        transcript_text = (apply_formatting(text, language=language) + "\n") if text else ""
+
+    def build_docx_bytes(rendered_text: str) -> bytes:
+        doc = Document()
+        for block in rendered_text.strip().split("\n\n") if rendered_text.strip() else []:
+            for line in block.split("\n"):
+                doc.add_paragraph(line)
+
+        buf = BytesIO()
+        doc.save(buf)
+        return buf.getvalue()
 
     storage.save_output(
         job_id,
@@ -1375,21 +2038,49 @@ def save_outputs(storage, job_id: str, result: Dict[str, Any]):
         "text/plain; charset=utf-8",
     )
 
-    doc = Document()
-
-    for block in transcript_text.strip().split("\n\n") if transcript_text.strip() else []:
-        for line in block.split("\n"):
-            doc.add_paragraph(line)
-
-    buf = BytesIO()
-    doc.save(buf)
-
     storage.save_output(
         job_id,
         "transcript.docx",
-        buf.getvalue(),
+        build_docx_bytes(transcript_text),
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+    if language == "ht":
+        if segments:
+            cleaned_segments = _clean_ht_segments_for_output(segments, metadata=result.get("debug"))
+            cleaned_transcript_text = (
+                _build_transcript_text(cleaned_segments, language=language)
+                if _has_speaker_labels(cleaned_segments)
+                else _build_plain_paragraph_transcript(cleaned_segments, language=language)
+            )
+        else:
+            cleaned_text = run_ht_cleanup_pipeline(text or transcript_text, metadata=result.get("debug"))
+            cleaned_transcript_text = cleaned_text.strip() + "\n" if cleaned_text.strip() else ""
+
+        storage.save_output(
+            job_id,
+            "transcript.raw.txt",
+            transcript_text.encode("utf-8"),
+            "text/plain; charset=utf-8",
+        )
+        storage.save_output(
+            job_id,
+            "transcript.raw.docx",
+            build_docx_bytes(transcript_text),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        storage.save_output(
+            job_id,
+            "transcript.clean.txt",
+            cleaned_transcript_text.encode("utf-8"),
+            "text/plain; charset=utf-8",
+        )
+        storage.save_output(
+            job_id,
+            "transcript.clean.docx",
+            build_docx_bytes(cleaned_transcript_text),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
 
     speaker_segments = result.get("speaker_segments")
     if isinstance(speaker_segments, list):
@@ -1413,7 +2104,7 @@ def save_outputs(storage, job_id: str, result: Dict[str, Any]):
 
         srt = _segments_to_srt(segments)
         vtt = _segments_to_vtt(segments)
-        html = _build_podcast_html(job_id, segments, diarization=diarization)
+        html = _build_podcast_html(job_id, segments, diarization=diarization, language=language)
 
         storage.save_output(
             job_id,

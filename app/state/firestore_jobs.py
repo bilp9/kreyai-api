@@ -35,6 +35,8 @@ def _job_matches(
     status: Optional[str] = None,
     language: Optional[str] = None,
     email_query: Optional[str] = None,
+    created_from: Optional[str] = None,
+    created_to: Optional[str] = None,
 ) -> bool:
     if status and _normalized_text(job.get("status")) != _normalized_text(status):
         return False
@@ -43,6 +45,13 @@ def _job_matches(
         return False
 
     if email_query and email_query not in _normalized_text(job.get("email")):
+        return False
+
+    created_at = str(job.get("created_at") or "").strip()
+    if created_from and created_at and created_at < created_from:
+        return False
+
+    if created_to and created_at and created_at > created_to:
         return False
 
     return True
@@ -54,11 +63,15 @@ def list_recent_jobs(
     status: Optional[str] = None,
     language: Optional[str] = None,
     email_query: Optional[str] = None,
+    created_from: Optional[str] = None,
+    created_to: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     jobs: List[Dict[str, Any]] = []
     normalized_email_query = _normalized_text(email_query)
     normalized_status = _normalized_text(status)
     normalized_language = _normalized_text(language)
+    normalized_created_from = str(created_from or "").strip() or None
+    normalized_created_to = str(created_to or "").strip() or None
     batch_size = max(limit * 4, 100) if normalized_email_query else limit
     max_scanned = max(limit * 20, 500)
 
@@ -70,6 +83,12 @@ def list_recent_jobs(
 
         if normalized_language:
             query = query.where("language", "==", normalized_language)
+
+        if normalized_created_from:
+            query = query.where("created_at", ">=", normalized_created_from)
+
+        if normalized_created_to:
+            query = query.where("created_at", "<=", normalized_created_to)
 
         query = query.order_by("created_at", direction=firestore.Query.DESCENDING)
 
@@ -94,6 +113,8 @@ def list_recent_jobs(
                     status=normalized_status,
                     language=normalized_language,
                     email_query=normalized_email_query,
+                    created_from=normalized_created_from,
+                    created_to=normalized_created_to,
                 ):
                     jobs.append(job)
                     if len(jobs) >= limit:
@@ -112,6 +133,8 @@ def list_recent_jobs(
                 status=normalized_status,
                 language=normalized_language,
                 email_query=normalized_email_query,
+                created_from=normalized_created_from,
+                created_to=normalized_created_to,
             ):
                 jobs.append(job)
 

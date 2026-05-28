@@ -26,14 +26,16 @@ def _coerce_active(value: Any) -> bool:
 def get_user_by_api_key(api_key: str) -> Optional[User]:
     # --- STEP 1: Check Environment Variable (Bypass file issues) ---
     env_key = os.getenv("API_KEY")
-    if env_key and api_key == env_key:
-        return User(
-            id="admin-env",
-            name="Admin User",
-            plan="soft-launch",
-            active=True,
-            email=os.getenv("ADMIN_EMAIL", ""),
-        )
+    if env_key:
+        if api_key == env_key:
+            return User(
+                id="admin-env",
+                name="Admin User",
+                plan="soft-launch",
+                active=True,
+                email=os.getenv("ADMIN_EMAIL", ""),
+            )
+        return None
 
     # --- STEP 2: Check JSON File ---
     if not DATA_PATH.exists():

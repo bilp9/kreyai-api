@@ -108,12 +108,22 @@ class GCSStorage:
     def blob_exists(self, blob_path: str) -> bool:
         return self.bucket.blob(blob_path).exists()
 
+    def download_text(self, blob_path: str, *, encoding: str = "utf-8") -> str:
+        blob = self.bucket.blob(blob_path)
+        if not blob.exists():
+            raise RuntimeError(f"GCS file not found: {blob_path}")
+        return blob.download_as_text(encoding=encoding)
+
     def delete_prefix(self, prefix: str) -> int:
         deleted = 0
         for blob in self.client.list_blobs(self.bucket_name, prefix=prefix):
             blob.delete()
             deleted += 1
         return deleted
+
+    def prefix_exists(self, prefix: str) -> bool:
+        blobs = self.client.list_blobs(self.bucket_name, prefix=prefix, max_results=1)
+        return any(True for _ in blobs)
 
     # -------------------------------------------------
     # SAVE OUTPUT
@@ -135,6 +145,35 @@ class GCSStorage:
         )
 
         return blob_path
+
+    def save_output_text(
+        self,
+        job_id: str,
+        filename: str,
+        text: str,
+        *,
+        content_type: str = "text/plain; charset=utf-8",
+        encoding: str = "utf-8",
+    ):
+        return self.save_output(
+            job_id,
+            filename,
+            text.encode(encoding),
+            content_type,
+        )
+
+    def output_exists(self, job_id: str, filename: str) -> bool:
+        return self.blob_exists(self.output_blob_path(job_id, filename))
+
+    def read_output_text(self, job_id: str, filename: str, *, encoding: str = "utf-8") -> str:
+        return self.download_text(self.output_blob_path(job_id, filename), encoding=encoding)
+
+    def delete_output(self, job_id: str, filename: str) -> bool:
+        blob = self.bucket.blob(self.output_blob_path(job_id, filename))
+        if not blob.exists():
+            return False
+        blob.delete()
+        return True
 
     # -------------------------------------------------
     # SIGNED DOWNLOAD URL (7 days)

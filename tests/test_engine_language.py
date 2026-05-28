@@ -45,7 +45,7 @@ def test_transcribe_audio_uses_autodetect_for_auto_language(monkeypatch):
     assert result["language_requested"] == "auto"
     assert result["language_detected"] == "es"
     assert result["language"] == "es"
-    assert result["text"] == "Hola mundo"
+    assert result["text"] == "Hola mundo."
 
 
 def test_transcribe_audio_preserves_explicit_language(monkeypatch):

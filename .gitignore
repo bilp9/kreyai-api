@@ -13,6 +13,7 @@ __pycache__/
 
 # Local runtime
 queue.db
+data/api_keys.json
 
 # Ignore uploaded media files only
 app/storage/*.m4a
