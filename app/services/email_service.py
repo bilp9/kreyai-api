@@ -2,6 +2,7 @@
 
 import os
 import httpx
+from html import escape
 from urllib.parse import urlencode
 
 from app.constants import VERIFICATION_CODE_TTL_MINUTES
@@ -14,6 +15,14 @@ INTERNAL_ORDER_NOTIFICATION_EMAILS = [
     email.strip()
     for email in os.getenv(
         "INTERNAL_ORDER_NOTIFICATION_EMAILS",
+        "support@kreyai.com",
+    ).split(",")
+    if email.strip()
+]
+INTERNAL_SALES_NOTIFICATION_EMAILS = [
+    email.strip()
+    for email in os.getenv(
+        "INTERNAL_SALES_NOTIFICATION_EMAILS",
         "support@kreyai.com",
     ).split(",")
     if email.strip()
@@ -287,6 +296,154 @@ async def send_credit_purchase_confirmation_email(
     await _send_email(
         email,
         "Your KreyAI minutes are available",
+        html_content,
+    )
+
+
+async def send_dekk_license_email(
+    *,
+    email: str,
+    plan_name: str,
+    license_key: str,
+    amount_total_cents: int | None = None,
+):
+    amount_line = ""
+    if isinstance(amount_total_cents, int) and amount_total_cents > 0:
+        amount_line = f"""
+      <p style="font-size:13px; color:#777;">
+        Charged: ${amount_total_cents / 100:.2f}
+      </p>
+        """
+
+    dekk_url = f"{FRONTEND_BASE_URL}/dekk"
+
+    html_content = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.6; color:#111;">
+      <h2>Your Dekk license key</h2>
+
+      <p>Thank you for purchasing <strong>{plan_name}</strong>.</p>
+
+      <p>
+        Copy this license key, open Dekk, and choose <strong>License</strong> in the app window.
+        You can also use <strong>Help &gt; Activate License</strong> from the macOS menu bar.
+      </p>
+
+      <pre style="white-space:pre-wrap;background:#f4f6fb;border:1px solid #d9def1;border-radius:8px;padding:12px;font-size:13px;line-height:1.5;">{license_key}</pre>
+
+      {amount_line}
+
+      <p>
+        Download and release information is available on the
+        <a href="{dekk_url}">Dekk page</a>.
+      </p>
+
+      <p>If you need help, reply to this email or contact <a href="mailto:support@kreyai.com">support@kreyai.com</a>.</p>
+
+      <p style="font-size:13px; color:#777;">
+        Keep this email for your records. KreyAI Dekk verifies license keys locally on your device.
+      </p>
+    </div>
+    """
+
+    await _send_email(
+        email,
+        "Your Dekk license key — KreyAI",
+        html_content,
+    )
+
+
+async def send_atelier_license_email(
+    *,
+    email: str,
+    plan_name: str,
+    license_key: str,
+    amount_total_cents: int | None = None,
+):
+    amount_line = ""
+    if isinstance(amount_total_cents, int) and amount_total_cents > 0:
+        amount_line = f"""
+      <p style="font-size:13px; color:#777;">
+        Charged: ${amount_total_cents / 100:.2f}
+      </p>
+        """
+
+    atelier_url = f"{FRONTEND_BASE_URL}/atelier"
+
+    html_content = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.6; color:#111;">
+      <h2>Your aTelier license key</h2>
+
+      <p>Thank you for purchasing <strong>{plan_name}</strong>.</p>
+
+      <p>Copy this license key and paste it into aTelier from <strong>Settings &gt; License</strong>:</p>
+
+      <pre style="white-space:pre-wrap;background:#f4f6fb;border:1px solid #d9def1;border-radius:8px;padding:12px;font-size:13px;line-height:1.5;">{license_key}</pre>
+
+      {amount_line}
+
+      <p>
+        Download and release information is available on the
+        <a href="{atelier_url}">aTelier page</a>.
+      </p>
+
+      <p>If you need help, reply to this email or contact <a href="mailto:support@kreyai.com">support@kreyai.com</a>.</p>
+
+      <p style="font-size:13px; color:#777;">
+        Keep this email for your records. aTelier verifies license keys locally on your device.
+      </p>
+    </div>
+    """
+
+    await _send_email(
+        email,
+        "Your aTelier license key — KreyAI",
+        html_content,
+    )
+
+
+async def send_internal_license_sale_email(
+    *,
+    product_name: str,
+    plan_name: str,
+    customer_email: str,
+    amount_total_cents: int | None,
+    stripe_session_id: str,
+    license_id: str,
+):
+    amount = "Not reported"
+    if isinstance(amount_total_cents, int) and amount_total_cents >= 0:
+        amount = f"${amount_total_cents / 100:.2f}"
+
+    safe_product = escape(product_name)
+    safe_plan = escape(plan_name)
+    safe_email = escape(customer_email)
+    safe_session = escape(stripe_session_id)
+    safe_license_id = escape(license_id)
+
+    html_content = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.6; color:#111;">
+      <h2>New {safe_product} license sale</h2>
+
+      <p>A paid checkout produced a new license.</p>
+
+      <ul>
+        <li><strong>Product:</strong> {safe_product}</li>
+        <li><strong>Plan:</strong> {safe_plan}</li>
+        <li><strong>Customer:</strong> {safe_email}</li>
+        <li><strong>Amount:</strong> {amount}</li>
+        <li><strong>Stripe session:</strong> {safe_session}</li>
+        <li><strong>License ID:</strong> {safe_license_id}</li>
+      </ul>
+
+      <p style="font-size:13px; color:#777;">
+        The license key is intentionally excluded from this internal notification.
+      </p>
+    </div>
+    """
+
+    await _send_emails(
+        INTERNAL_SALES_NOTIFICATION_EMAILS,
+        f"New {product_name} license sale — {plan_name}",
         html_content,
     )
 

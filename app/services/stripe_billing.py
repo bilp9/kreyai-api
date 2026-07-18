@@ -62,8 +62,16 @@ def _frontend_base_url() -> str:
     return os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
 
 
+def stripe_checkout_is_configured() -> bool:
+    return bool(os.getenv("STRIPE_SECRET_KEY", "").strip())
+
+
+def stripe_webhook_is_configured() -> bool:
+    return bool(os.getenv("STRIPE_WEBHOOK_SECRET", "").strip())
+
+
 def stripe_is_configured() -> bool:
-    return bool(os.getenv("STRIPE_SECRET_KEY") and os.getenv("STRIPE_WEBHOOK_SECRET"))
+    return stripe_checkout_is_configured() and stripe_webhook_is_configured()
 
 
 def _api_key() -> str:

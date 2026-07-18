@@ -83,13 +83,15 @@ app.add_middleware(JobAccessMiddleware)
 # -------------------------------------------------
 # Routes
 # -------------------------------------------------
-from app.routes import billing, jobs, ops, upload
+from app.routes import atelier, billing, dekk, jobs, ops, upload
 
 app.include_router(jobs.router)
 app.include_router(ops.router)
 app.include_router(upload.router)
 app.include_router(billing.router)
 app.include_router(billing.stripe_router)
+app.include_router(dekk.router)
+app.include_router(atelier.router)
 
 # -------------------------------------------------
 # Serve OpenAPI YAML

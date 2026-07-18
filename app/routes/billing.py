@@ -9,7 +9,14 @@ from app.services.credits import (
     is_valid_billing_email,
     normalize_billing_email,
 )
-from app.services.email_service import send_credit_purchase_confirmation_email
+from app.services.atelier_licenses import issue_atelier_license_for_checkout
+from app.services.dekk_licenses import issue_dekk_license_for_checkout
+from app.services.email_service import (
+    send_atelier_license_email,
+    send_credit_purchase_confirmation_email,
+    send_dekk_license_email,
+    send_internal_license_sale_email,
+)
 from app.services.stripe_billing import (
     create_checkout_session,
     get_credit_pack,
@@ -108,9 +115,65 @@ async def stripe_webhook_route(request: Request):
         if payment_status == "paid":
             customer_email = str(customer_details.get("email") or "")
             email = normalize_billing_email(metadata.get("email") or customer_email)
+            product = str(metadata.get("product") or "transcription").strip().lower()
+            session_id = str(getattr(session, "id", "") or "")
+
+            if product == "dekk":
+                plan = str(metadata.get("plan") or "").strip().lower()
+                if email and plan and session_id:
+                    result = issue_dekk_license_for_checkout(
+                        session_id=session_id,
+                        email=email,
+                        plan_id=plan,
+                        amount_total=getattr(session, "amount_total", None),
+                        stripe_customer_id=getattr(session, "customer", None),
+                    )
+                    if result.get("applied"):
+                        await send_dekk_license_email(
+                            email=email,
+                            plan_name=str(result.get("plan_name") or "Dekk"),
+                            license_key=str(result.get("license_key") or ""),
+                            amount_total_cents=getattr(session, "amount_total", None),
+                        )
+                        await send_internal_license_sale_email(
+                            product_name="Dekk",
+                            plan_name=str(result.get("plan_name") or "Dekk"),
+                            customer_email=email,
+                            amount_total_cents=getattr(session, "amount_total", None),
+                            stripe_session_id=session_id,
+                            license_id=str(result.get("license_id") or ""),
+                        )
+                return {"received": True}
+
+            if product == "atelier":
+                plan = str(metadata.get("plan") or "").strip().lower()
+                if email and plan and session_id:
+                    result = issue_atelier_license_for_checkout(
+                        session_id=session_id,
+                        email=email,
+                        plan_id=plan,
+                        amount_total=getattr(session, "amount_total", None),
+                        stripe_customer_id=getattr(session, "customer", None),
+                    )
+                    if result.get("applied"):
+                        await send_atelier_license_email(
+                            email=email,
+                            plan_name=str(result.get("plan_name") or "aTelier Classic"),
+                            license_key=str(result.get("license_key") or ""),
+                            amount_total_cents=getattr(session, "amount_total", None),
+                        )
+                        await send_internal_license_sale_email(
+                            product_name="aTelier",
+                            plan_name=str(result.get("plan_name") or "aTelier Classic"),
+                            customer_email=email,
+                            amount_total_cents=getattr(session, "amount_total", None),
+                            stripe_session_id=session_id,
+                            license_id=str(result.get("license_id") or ""),
+                        )
+                return {"received": True}
+
             pack_id = str(metadata.get("pack_id") or "").strip().lower()
             credits_minutes = int(metadata.get("credits_minutes") or 0)
-            session_id = str(getattr(session, "id", "") or "")
             if email and pack_id and credits_minutes > 0 and session_id:
                 pack = get_credit_pack(pack_id)
                 result = add_credit_minutes(

@@ -12,6 +12,7 @@ google-cloud-firestore
 google-cloud-run
 httpx
 stripe
+cryptography>=43,<46
 huggingface_hub
 torch
 torchaudio
