@@ -215,6 +215,7 @@ def issue_dekk_license_for_checkout(
 
 def record_dekk_download_event(
     *,
+    product: str | None = None,
     version: str | None = None,
     platform: str | None = None,
     source: str | None = None,
@@ -222,8 +223,11 @@ def record_dekk_download_event(
     user_agent_hash: str | None = None,
     referer: str | None = None,
 ) -> dict[str, Any]:
+    normalized_product = (product or PRODUCT_ID).strip().lower()
+    if normalized_product not in {"dekk", "atelier"}:
+        raise ValueError("Unknown product")
     record = {
-        "product": PRODUCT_ID,
+        "product": normalized_product,
         "version": (version or "").strip() or None,
         "platform": (platform or "").strip().lower() or "macos",
         "source": (source or "").strip().lower() or "website",
@@ -246,12 +250,15 @@ def get_dekk_download_summary(limit: int = 5000) -> dict[str, Any]:
     events = [doc.to_dict() or {} for doc in query.stream()]
 
     by_version: dict[str, int] = {}
+    by_product: dict[str, int] = {}
     by_platform: dict[str, int] = {}
     by_source: dict[str, int] = {}
     for event in events:
+        product = str(event.get("product") or PRODUCT_ID)
         version = str(event.get("version") or "unknown")
         platform = str(event.get("platform") or "unknown")
         source = str(event.get("source") or "unknown")
+        by_product[product] = by_product.get(product, 0) + 1
         by_version[version] = by_version.get(version, 0) + 1
         by_platform[platform] = by_platform.get(platform, 0) + 1
         by_source[source] = by_source.get(source, 0) + 1
@@ -259,6 +266,7 @@ def get_dekk_download_summary(limit: int = 5000) -> dict[str, Any]:
     return {
         "total": len(events),
         "sample_limit": limit,
+        "by_product": by_product,
         "by_version": by_version,
         "by_platform": by_platform,
         "by_source": by_source,

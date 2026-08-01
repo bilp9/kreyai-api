@@ -12,6 +12,7 @@ from app.constants import JobStatus
 from app.models.user import User
 from app.services.access_control import resolve_submission_access, serialize_access_decision
 from app.services.credits import adjust_credit_minutes, ensure_starter_credit_grant, get_credit_account, list_credit_ledger
+from app.services.dekk_licenses import get_dekk_download_summary
 from app.services.docx_export import build_docx_bytes
 from app.services.partner_plans import (
     get_partner_plan_status,
@@ -48,6 +49,14 @@ class HTReviewRunRequest(BaseModel):
 
 class HTReviewApproveRequest(BaseModel):
     approved_text: str
+
+
+@router.get("/product-downloads")
+def get_product_downloads(
+    limit: int = Query(5000, ge=1, le=10000),
+    user: User = Depends(get_current_user),
+):
+    return get_dekk_download_summary(limit=limit)
 
 
 def _normalize_email(email: str) -> str:

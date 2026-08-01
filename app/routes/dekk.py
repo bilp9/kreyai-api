@@ -23,6 +23,7 @@ class CreateDekkCheckoutSessionRequest(BaseModel):
 
 
 class DekkDownloadEventRequest(BaseModel):
+    product: str | None = None
     version: str | None = None
     platform: str | None = None
     source: str | None = None
@@ -60,11 +61,15 @@ def create_dekk_checkout_session_route(payload: CreateDekkCheckoutSessionRequest
 
 @router.post("/download-event")
 def record_dekk_download_event_route(payload: DekkDownloadEventRequest):
-    return record_dekk_download_event(
-        version=payload.version,
-        platform=payload.platform,
-        source=payload.source,
-        ip_hash=payload.ip_hash,
-        user_agent_hash=payload.user_agent_hash,
-        referer=payload.referer,
-    )
+    try:
+        return record_dekk_download_event(
+            product=payload.product,
+            version=payload.version,
+            platform=payload.platform,
+            source=payload.source,
+            ip_hash=payload.ip_hash,
+            user_agent_hash=payload.user_agent_hash,
+            referer=payload.referer,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
