@@ -14,6 +14,7 @@ __pycache__/
 # Local runtime
 queue.db
 data/api_keys.json
+local_outputs/
 
 # Ignore uploaded media files only
 app/storage/*.m4a
@@ -22,3 +23,6 @@ app/storage/*.mp4
 app/storage/*.MOV
 app/storage/evals/
 app/storage/uploads/cors.json
+app/storage/metrics/*.jsonl
+app/transcription/feedback/*.jsonl
+*.save

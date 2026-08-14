@@ -1,4 +1,6 @@
-# Kreyai — Phase 1 Specification
+# KreyAI — Phase 1 Specification (Historical)
+
+> Archived: this document describes an early development phase and is not current product or operational documentation.
 
 ## Overview
 

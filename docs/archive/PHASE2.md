@@ -1,4 +1,6 @@
-# Kreyai — Phase 2 Technical Scope
+# KreyAI — Phase 2 Technical Scope (Historical)
+
+> Archived: this document describes an early development phase and is not current product or operational documentation.
 
 Phase 2 builds on the stabilized Phase 1 API and introduces
 job execution, resiliency, and processing orchestration.

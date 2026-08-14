@@ -5,13 +5,34 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.auth.auth import authenticate_api_key, extract_api_key
 
 
+PUBLIC_EXACT_PATHS = {
+    "/",
+    "/health",
+    "/openapi.json",
+    "/openapi.yaml",
+    "/api/public-config",
+    "/api/verify",
+    "/api/billing/config",
+    "/api/billing/balance",
+    "/api/billing/checkout-session",
+    "/api/stripe/webhook",
+    "/api/atelier/config",
+    "/api/atelier/checkout-session",
+    "/api/atelier/activate",
+    "/api/atelier/deactivate",
+    "/api/dekk/config",
+    "/api/dekk/checkout-session",
+    "/api/dekk/download-event",
+}
+
+
 def _is_public_path(path: str) -> bool:
+    """Return only routes that implement their own customer access controls."""
     return (
-        path == "/"
-        or path.startswith("/health")
+        path in PUBLIC_EXACT_PATHS
         or path.startswith("/docs")
-        or path.startswith("/openapi")
-        or path.startswith("/api")
+        or path == "/api/"
+        or path.startswith("/api/jobs/")
     )
 
 
@@ -30,7 +51,8 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # ----------------------------------------
-        # 🔐 EVERYTHING ELSE REQUIRES API KEY
+        # Everything not explicitly public requires an API key. Customer job
+        # routes enforce their scoped job token inside the route handler.
         # ----------------------------------------
         try:
             user = authenticate_api_key(

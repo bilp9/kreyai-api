@@ -1,92 +1,63 @@
-Kreyai API — Phase 1
+# KreyAI API
 
-Kreyai is a secure, email-verified transcription job system designed for high-fidelity language processing workflows.
+Backend services for KreyAI Transcription, Adwaz operations, and desktop-product checkout and licensing.
 
-Phase-1 establishes a stable job intake and verification layer.
-Audio processing is intentionally out of scope at this stage.
+## Responsibilities
 
-🔐 Phase-1 Scope (Frozen)
-Implemented
+- Create and verify transcription jobs
+- Issue signed upload and download access
+- Dispatch transcription processing and recover interrupted jobs
+- Manage transcription credits and Stripe webhooks
+- Activate aTelier licenses and sell aTelier and Dekk licenses
+- Expose authenticated operational reporting and Haitian Creole review workflows
 
-Job creation with unique job ID
+The public website lives in the separate `kreyai-web` repository. aTelier and Dekk desktop source code are maintained separately.
 
-Email-based verification (code + job ID)
+## Runtime
 
-Explicit job lifecycle states
+- Python 3.11 or 3.12
+- FastAPI
+- Google Cloud Run, Cloud Storage, and Firestore
+- Stripe for checkout
+- Optional GPU worker jobs for diarization and heavier transcription work
 
-OpenAPI documentation via Swagger
+## Local Setup
 
-No authentication accounts required
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+```
 
-No persistent storage (in-memory, dev)
+Copy `.env.example` to `.env` when local credentials are needed. Never commit secrets or production service-account material.
 
-Out of Scope (Phase-2+)
+## Route Ownership
 
-Audio uploads
+- `/health`: service health
+- `/api/*`: customer job, checkout, credit, and desktop-license workflows
+- `/ops/*`: API-key-protected operational tools
+- `/docs` and `/openapi.json`: generated FastAPI contract for implemented routes
 
-Transcription processing
+Customer job routes use scoped job tokens. Operational routes require an API key. New routes should be private by default and added to the explicit public allowlist only when they implement their own access control.
 
-Payments
+## Tests
 
-User accounts
+```bash
+pytest
+```
 
-Long-term storage
+Run focused tests while developing, then run the full suite before deployment.
 
-Webhooks / notifications
+## Deployment
 
-🔁 Job Lifecycle
-pending_verification → verified
+Cloud Run deployment definitions and operational documentation live under `cloudbuild*.yaml` and `docs/`. Production configuration is supplied through environment variables and Google Secret Manager.
 
+Important production checks:
 
-Only verified jobs may proceed to processing in Phase-2.
+- Confirm the Cloud Storage seven-day lifecycle policy is active.
+- Confirm scheduled reaper execution and alerts.
+- Confirm Stripe webhook signatures and desktop-license signing keys.
+- Smoke-test job creation, upload, processing, downloads, and immediate deletion.
 
-🌐 API Endpoints
-Create Job
-POST /api/
-
-
-Response
-
-{
-  "job_id": "KR-123456",
-  "status": "pending_verification",
-  "created_at": "ISO-8601 timestamp"
-}
-
-Verify Job
-POST /api/verify?job_id=KR-123456&code=123456
-
-
-Response
-
-{
-  "job_id": "KR-123456",
-  "status": "verified",
-  "verified_at": "ISO-8601 timestamp"
-}
-
-📄 API Docs
-
-Swagger UI available at:
-
-/docs
-
-🧪 Development Notes
-
-Email delivery is mocked (console output)
-
-Job storage is in-memory
-
-API contract is frozen for Phase-1
-
-Changes require versioning in Phase-2+
-
-🧭 Roadmap
-
-Phase-2: file uploads, processing pipeline, retention rules
-
-Phase-3: accounts, billing, advanced workflows
-
-License
-
-Private / internal — not open source (for now).
+See `docs/ops/retention.md` for storage-retention enforcement.
