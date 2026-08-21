@@ -35,10 +35,10 @@ RESEND_URL = "https://api.resend.com/emails"
 # Internal helper
 # -------------------------------------------------
 
-async def _send_email(to_email: str, subject: str, html: str):
+async def _send_email(to_email: str, subject: str, html: str) -> bool:
     if not RESEND_API_KEY:
         print("⚠️ RESEND_API_KEY not set — skipping email send")
-        return
+        return False
 
     payload = {
         "from": FROM_EMAIL,
@@ -57,8 +57,10 @@ async def _send_email(to_email: str, subject: str, html: str):
 
         if response.status_code not in (200, 201):
             print("❌ Resend error:", response.status_code, response.text)
+            return False
         else:
             print(f"📧 Email sent to {to_email}")
+            return True
 
 
 async def _send_emails(to_emails: list[str], subject: str, html: str):
@@ -406,7 +408,7 @@ async def send_linguist_partner_license_email(
     email: str,
     participant_name: str | None,
     licenses: dict[str, str],
-):
+) -> bool:
     safe_name = escape(str(participant_name or "").strip())
     greeting = f"Hello {safe_name}," if safe_name else "Hello,"
     product_sections = []
@@ -449,7 +451,7 @@ async def send_linguist_partner_license_email(
     </div>
     """
 
-    await _send_email(
+    return await _send_email(
         email,
         "Your KreyAI Linguist Partner licenses",
         html_content,

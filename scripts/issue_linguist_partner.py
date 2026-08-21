@@ -16,13 +16,14 @@ from urllib.request import Request, urlopen
 DEFAULT_API_BASE = "https://kreyai-api-98057750771.us-central1.run.app"
 
 
-def issue(*, api_base: str, api_key: str, email: str, name: str, cohort: str, products: list[str]) -> dict:
+def issue(*, api_base: str, api_key: str, email: str, name: str, cohort: str, products: list[str], resend: bool) -> dict:
     payload = json.dumps(
         {
             "email": email,
             "name": name or None,
             "cohort": cohort,
             "products": products,
+            "resend": resend,
         }
     ).encode("utf-8")
     request = Request(
@@ -59,6 +60,7 @@ def main() -> int:
     parser.add_argument("--name", default="", help="Participant name when using --email.")
     parser.add_argument("--cohort", default="2026", help="Program cohort label.")
     parser.add_argument("--products", default="atelier,dekk", help="Comma-separated products: atelier,dekk.")
+    parser.add_argument("--resend", action="store_true", help="Resend existing licenses instead of creating duplicates.")
     parser.add_argument("--api-base", default=os.getenv("KREYAI_API_BASE_URL", DEFAULT_API_BASE))
     args = parser.parse_args()
 
@@ -82,6 +84,7 @@ def main() -> int:
                 name=participant["name"],
                 cohort=args.cohort,
                 products=products,
+                resend=args.resend,
             )
             issued = [product for product, data in result.get("products", {}).items() if data.get("issued")]
             status = f"issued {', '.join(issued)}" if issued else "already issued"

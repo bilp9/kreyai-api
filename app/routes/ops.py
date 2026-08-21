@@ -42,6 +42,7 @@ class LinguistPartnerLicenseRequest(BaseModel):
     name: Optional[str] = None
     cohort: str = "2026"
     products: List[str] = Field(default_factory=lambda: ["atelier", "dekk"])
+    resend: bool = False
 
 
 class BillingAdjustmentRequest(BaseModel):
@@ -99,7 +100,7 @@ async def issue_linguist_partner_license_route(
                 issued_by=issued_by,
             )
             results["atelier"] = result
-            if result.get("applied"):
+            if result.get("applied") or payload.resend:
                 licenses_to_email["atelier"] = str(result.get("license_key") or "")
 
         if "dekk" in products:
@@ -111,13 +112,14 @@ async def issue_linguist_partner_license_route(
                 issued_by=issued_by,
             )
             results["dekk"] = result
-            if result.get("applied"):
+            if result.get("applied") or payload.resend:
                 licenses_to_email["dekk"] = str(result.get("license_key") or "")
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    email_sent = False
     if licenses_to_email:
-        await send_linguist_partner_license_email(
+        email_sent = await send_linguist_partner_license_email(
             email=email,
             participant_name=payload.name,
             licenses=licenses_to_email,
@@ -134,7 +136,7 @@ async def issue_linguist_partner_license_route(
             }
             for product, result in results.items()
         },
-        "email_sent": bool(licenses_to_email),
+        "email_sent": bool(email_sent),
         "issued_by": issued_by,
     }
 

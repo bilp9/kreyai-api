@@ -19,6 +19,7 @@ def test_partner_license_route_issues_both_products_without_returning_keys(monke
 
     async def fake_email(**kwargs):
         emails.append(kwargs)
+        return True
 
     monkeypatch.setattr(ops, "issue_atelier_partner_license", fake_issue)
     monkeypatch.setattr(ops, "issue_dekk_partner_license", fake_issue)
@@ -70,3 +71,39 @@ def test_partner_license_route_is_idempotent_and_does_not_resend(monkeypatch):
 
     assert response["email_sent"] is False
     assert response["products"]["atelier"]["issued"] is False
+
+
+def test_partner_license_route_can_resend_existing_key(monkeypatch):
+    emails = []
+
+    monkeypatch.setattr(
+        ops,
+        "issue_atelier_partner_license",
+        lambda **kwargs: {
+            "applied": False,
+            "license_id": "atelier_existing",
+            "license_key": "EXISTING-SECRET",
+        },
+    )
+
+    async def fake_email(**kwargs):
+        emails.append(kwargs)
+        return True
+
+    monkeypatch.setattr(ops, "send_linguist_partner_license_email", fake_email)
+
+    response = asyncio.run(
+        ops.issue_linguist_partner_license_route(
+            ops.LinguistPartnerLicenseRequest(
+                email="partner@example.com",
+                products=["atelier"],
+                resend=True,
+            ),
+            User(id="ops-user", email="owner@example.com"),
+        )
+    )
+
+    assert response["email_sent"] is True
+    assert response["products"]["atelier"]["issued"] is False
+    assert "EXISTING-SECRET" not in str(response)
+    assert emails[0]["licenses"] == {"atelier": "EXISTING-SECRET"}

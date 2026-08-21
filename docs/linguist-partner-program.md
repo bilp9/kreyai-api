@@ -108,6 +108,16 @@ python scripts/issue_linguist_partner.py \
 
 Retries are idempotent for the same email and cohort. The command does not print license keys. Newly generated keys are sent directly to the participant's email address.
 
+To resend previously issued licenses without generating replacements:
+
+```bash
+python scripts/issue_linguist_partner.py \
+  --email translator@example.com \
+  --name "Translator Name" \
+  --cohort 2026 \
+  --resend
+```
+
 ## Security rules
 
 - Never send signing keys, operations API keys, or full participant lists through email or chat.
@@ -158,11 +168,11 @@ When a participant reports a problem:
 
 ## Resend, replacement, and revocation
 
-The current issuance command is idempotent: rerunning it does not create duplicate licenses. A dedicated secure resend command and a dedicated partner-license revocation command are still required before broad enrollment.
+The issuance command is idempotent: rerunning it does not create duplicate licenses. Use `--resend` to send the existing key again without printing it. A dedicated partner-license revocation command is still required before broad enrollment.
 
 Until those tools exist:
 
-- Do not manually create a second license to work around an email-delivery failure.
+- Do not manually create a second license to work around an email-delivery failure; use `--resend`.
 - Do not edit signed license payloads or production records by hand.
 - Investigate delivery through the transactional-email provider and recover the existing issuance through an approved administrative path.
 - Escalate suspected compromise or misuse before changing activation state.
