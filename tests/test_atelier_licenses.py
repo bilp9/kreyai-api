@@ -121,8 +121,10 @@ def test_partner_license_allows_two_computers_and_rejects_third(monkeypatch, tes
     fake_db = _FakeDB()
     monkeypatch.setattr(al, "db", fake_db)
     payload = al.make_license_payload(email="partner@example.com", plan_id="linguist_partner")
+    payload["participant_id"] = "partner-one"
     payload["max_devices"] = 2
     key = al.sign_license_payload(payload)
+    fake_db.collection(al.LICENSE_COLLECTION).document("partner_partner-one").set({"status": "active"})
 
     assert al.activate_atelier_license(license_key=key, machine_id="mac-one")["valid"] is True
     assert al.activate_atelier_license(license_key=key, machine_id="mac-two")["valid"] is True
@@ -136,8 +138,10 @@ def test_partner_deactivation_frees_one_computer_slot(monkeypatch, test_keypair)
     fake_db = _FakeDB()
     monkeypatch.setattr(al, "db", fake_db)
     payload = al.make_license_payload(email="partner@example.com", plan_id="linguist_partner")
+    payload["participant_id"] = "partner-one"
     payload["max_devices"] = 2
     key = al.sign_license_payload(payload)
+    fake_db.collection(al.LICENSE_COLLECTION).document("partner_partner-one").set({"status": "active"})
 
     al.activate_atelier_license(license_key=key, machine_id="mac-one")
     al.activate_atelier_license(license_key=key, machine_id="mac-two")
@@ -146,3 +150,19 @@ def test_partner_deactivation_frees_one_computer_slot(monkeypatch, test_keypair)
         "deactivated": True,
     }
     assert al.activate_atelier_license(license_key=key, machine_id="mac-three")["valid"] is True
+
+
+def test_revoked_partner_license_cannot_activate(monkeypatch, test_keypair):
+    fake_db = _FakeDB()
+    monkeypatch.setattr(al, "db", fake_db)
+    payload = al.make_license_payload(email="partner@example.com", plan_id="linguist_partner")
+    payload["participant_id"] = "partner-one"
+    key = al.sign_license_payload(payload)
+    fake_db.collection(al.LICENSE_COLLECTION).document("partner_partner-one").set(
+        {"status": "revoked", "license_id": payload["license_id"]}
+    )
+
+    result = al.activate_atelier_license(license_key=key, machine_id="mac-one")
+
+    assert result["valid"] is False
+    assert "no longer active" in result["error"]

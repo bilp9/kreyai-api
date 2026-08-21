@@ -118,6 +118,17 @@ python scripts/issue_linguist_partner.py \
   --resend
 ```
 
+To record revocation for approved products:
+
+```bash
+python scripts/issue_linguist_partner.py \
+  --email translator@example.com \
+  --cohort 2026 \
+  --products atelier,dekk \
+  --revoke \
+  --reason "Program access ended"
+```
+
 ## Security rules
 
 - Never send signing keys, operations API keys, or full participant lists through email or chat.
@@ -168,16 +179,16 @@ When a participant reports a problem:
 
 ## Resend, replacement, and revocation
 
-The issuance command is idempotent: rerunning it does not create duplicate licenses. Use `--resend` to send the existing key again without printing it. A dedicated partner-license revocation command is still required before broad enrollment.
+The issuance command is idempotent: rerunning it does not create duplicate licenses. Use `--resend` to send the existing key again without printing it. The protected operations API also records partner revocation by email, cohort, and product.
 
-Until those tools exist:
+Operational rules:
 
 - Do not manually create a second license to work around an email-delivery failure; use `--resend`.
 - Do not edit signed license payloads or production records by hand.
 - Investigate delivery through the transactional-email provider and recover the existing issuance through an approved administrative path.
 - Escalate suspected compromise or misuse before changing activation state.
 
-The future administrative workflow should support resending the existing key without exposing it to command output, revoking a participant, and recording who performed each action.
+aTelier checks partner status through its activation service, removes active-device records on revocation, and rejects later activation. Dekk remains offline-verifiable: revocation is an administrative record that blocks resending, replacement, and continued program support, but it cannot remotely disable a key already stored on an offline computer. This distinction must remain explicit in participant and operator documentation.
 
 ## Pilot rollout
 
@@ -195,7 +206,7 @@ Do not invite the full cohort before the first two participants have successfull
 - [ ] Participant agreement and privacy language reviewed
 - [ ] Application form tested
 - [ ] Production issuance endpoint deployed
-- [ ] Secure resend and revocation workflows available
+- [x] Secure resend and revocation workflows available
 - [ ] Current aTelier partner-compatible build published
 - [ ] Current Dekk partner-compatible build published
 - [ ] macOS clean-install test passed

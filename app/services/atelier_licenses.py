@@ -274,6 +274,7 @@ def issue_atelier_partner_license(
         {
             "license_name": "Linguist Partner License",
             "program": "kreyai_linguist_partner",
+            "participant_id": normalized_participant_id,
             "cohort": str(cohort or "2026").strip(),
             "max_devices": 2,
         }
@@ -299,6 +300,34 @@ def issue_atelier_partner_license(
     return {**record, "applied": True}
 
 
+def revoke_atelier_partner_license(
+    *, participant_id: str, revoked_by: str | None = None, reason: str | None = None
+) -> dict[str, Any]:
+    normalized_participant_id = str(participant_id or "").strip()
+    if not normalized_participant_id:
+        raise ValueError("A participant ID is required.")
+
+    doc_ref = db.collection(LICENSE_COLLECTION).document(f"partner_{normalized_participant_id}")
+    snap = doc_ref.get()
+    if not snap.exists:
+        return {"found": False, "revoked": False}
+
+    record = snap.to_dict() or {}
+    record.update(
+        {
+            "status": "revoked",
+            "revoked_by": str(revoked_by or "").strip() or None,
+            "revocation_reason": str(reason or "").strip() or None,
+            "revoked_at": firestore.SERVER_TIMESTAMP,
+        }
+    )
+    doc_ref.set(record)
+    license_id = str(record.get("license_id") or "").strip()
+    if license_id:
+        db.collection(ACTIVATION_COLLECTION).document(license_id).delete()
+    return {"found": True, "revoked": True, "license_id": license_id}
+
+
 def activate_atelier_license(*, license_key: str, machine_id: str) -> dict[str, Any]:
     machine_id = str(machine_id or "").strip()
     if not machine_id:
@@ -307,6 +336,15 @@ def activate_atelier_license(*, license_key: str, machine_id: str) -> dict[str, 
     payload = verify_license_key(license_key)
     if payload is None:
         return {"valid": False, "error": "Invalid license key."}
+
+    if payload.get("plan") == ATELIER_PARTNER_PLAN.id:
+        participant_id = str(payload.get("participant_id") or "").strip()
+        if not participant_id:
+            return {"valid": False, "error": "This partner license must be reissued. Contact support."}
+        partner_snap = db.collection(LICENSE_COLLECTION).document(f"partner_{participant_id}").get()
+        partner_record = partner_snap.to_dict() if partner_snap.exists else {}
+        if not partner_snap.exists or (partner_record or {}).get("status") == "revoked":
+            return {"valid": False, "error": "This partner license is no longer active. Contact support."}
 
     license_id = payload["license_id"]
     doc_ref = db.collection(ACTIVATION_COLLECTION).document(license_id)

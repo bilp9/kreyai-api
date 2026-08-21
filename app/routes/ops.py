@@ -13,8 +13,8 @@ from app.constants import JobStatus
 from app.models.user import User
 from app.services.access_control import resolve_submission_access, serialize_access_decision
 from app.services.credits import adjust_credit_minutes, ensure_starter_credit_grant, get_credit_account, list_credit_ledger
-from app.services.atelier_licenses import issue_atelier_partner_license
-from app.services.dekk_licenses import issue_dekk_partner_license
+from app.services.atelier_licenses import issue_atelier_partner_license, revoke_atelier_partner_license
+from app.services.dekk_licenses import issue_dekk_partner_license, revoke_dekk_partner_license
 from app.services.docx_export import build_docx_bytes
 from app.services.email_service import send_linguist_partner_license_email
 from app.services.partner_plans import (
@@ -43,6 +43,13 @@ class LinguistPartnerLicenseRequest(BaseModel):
     cohort: str = "2026"
     products: List[str] = Field(default_factory=lambda: ["atelier", "dekk"])
     resend: bool = False
+
+
+class LinguistPartnerRevokeRequest(BaseModel):
+    email: str
+    cohort: str = "2026"
+    products: List[str] = Field(default_factory=lambda: ["atelier", "dekk"])
+    reason: Optional[str] = None
 
 
 class BillingAdjustmentRequest(BaseModel):
@@ -100,6 +107,8 @@ async def issue_linguist_partner_license_route(
                 issued_by=issued_by,
             )
             results["atelier"] = result
+            if payload.resend and result.get("status") == "revoked":
+                raise ValueError("The aTelier partner license is revoked and cannot be resent.")
             if result.get("applied") or payload.resend:
                 licenses_to_email["atelier"] = str(result.get("license_key") or "")
 
@@ -112,6 +121,8 @@ async def issue_linguist_partner_license_route(
                 issued_by=issued_by,
             )
             results["dekk"] = result
+            if payload.resend and result.get("status") == "revoked":
+                raise ValueError("The Dekk partner license is revoked and cannot be resent.")
             if result.get("applied") or payload.resend:
                 licenses_to_email["dekk"] = str(result.get("license_key") or "")
     except (RuntimeError, ValueError) as exc:
@@ -138,6 +149,37 @@ async def issue_linguist_partner_license_route(
         },
         "email_sent": bool(email_sent),
         "issued_by": issued_by,
+    }
+
+
+@router.post("/licenses/linguist-partner/revoke")
+def revoke_linguist_partner_license_route(
+    payload: LinguistPartnerRevokeRequest,
+    user: User = Depends(get_current_user),
+):
+    email = _normalize_email(payload.email)
+    cohort = str(payload.cohort or "2026").strip() or "2026"
+    products = list(dict.fromkeys(str(item or "").strip().lower() for item in payload.products))
+    if not products or any(product not in {"atelier", "dekk"} for product in products):
+        raise HTTPException(status_code=400, detail="Products must include aTelier, Dekk, or both.")
+
+    participant_id = _linguist_partner_id(email=email, cohort=cohort)
+    revoked_by = user.email or user.id
+    results: dict[str, dict[str, Any]] = {}
+    if "atelier" in products:
+        results["atelier"] = revoke_atelier_partner_license(
+            participant_id=participant_id, revoked_by=revoked_by, reason=payload.reason
+        )
+    if "dekk" in products:
+        results["dekk"] = revoke_dekk_partner_license(
+            participant_id=participant_id, revoked_by=revoked_by, reason=payload.reason
+        )
+    return {
+        "participant_id": participant_id,
+        "email": email,
+        "cohort": cohort,
+        "products": results,
+        "revoked_by": revoked_by,
     }
 
 

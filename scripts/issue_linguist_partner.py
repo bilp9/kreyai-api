@@ -42,6 +42,31 @@ def issue(*, api_base: str, api_key: str, email: str, name: str, cohort: str, pr
         raise RuntimeError(f"Could not reach the license service: {exc.reason}") from exc
 
 
+def revoke(*, api_base: str, api_key: str, email: str, cohort: str, products: list[str], reason: str) -> dict:
+    payload = json.dumps(
+        {
+            "email": email,
+            "cohort": cohort,
+            "products": products,
+            "reason": reason or None,
+        }
+    ).encode("utf-8")
+    request = Request(
+        f"{api_base.rstrip('/')}/ops/licenses/linguist-partner/revoke",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json", "X-API-Key": api_key},
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"License service returned {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not reach the license service: {exc.reason}") from exc
+
+
 def participants(args) -> list[dict[str, str]]:
     if args.csv:
         with Path(args.csv).open(newline="", encoding="utf-8-sig") as handle:
@@ -61,6 +86,8 @@ def main() -> int:
     parser.add_argument("--cohort", default="2026", help="Program cohort label.")
     parser.add_argument("--products", default="atelier,dekk", help="Comma-separated products: atelier,dekk.")
     parser.add_argument("--resend", action="store_true", help="Resend existing licenses instead of creating duplicates.")
+    parser.add_argument("--revoke", action="store_true", help="Revoke program access instead of issuing a license.")
+    parser.add_argument("--reason", default="", help="Administrative reason used with --revoke.")
     parser.add_argument("--api-base", default=os.getenv("KREYAI_API_BASE_URL", DEFAULT_API_BASE))
     args = parser.parse_args()
 
@@ -68,6 +95,8 @@ def main() -> int:
     if not api_key:
         parser.error("KREYAI_OPS_API_KEY is required in the environment.")
     products = [value.strip().lower() for value in args.products.split(",") if value.strip()]
+    if args.resend and args.revoke:
+        parser.error("--resend and --revoke cannot be used together.")
 
     failures = 0
     for participant in participants(args):
@@ -77,6 +106,23 @@ def main() -> int:
             failures += 1
             continue
         try:
+            if args.revoke:
+                result = revoke(
+                    api_base=args.api_base,
+                    api_key=api_key,
+                    email=email,
+                    cohort=args.cohort,
+                    products=products,
+                    reason=args.reason,
+                )
+                revoked = [
+                    product
+                    for product, data in result.get("products", {}).items()
+                    if data.get("revoked")
+                ]
+                status = f"revoked {', '.join(revoked)}" if revoked else "no matching licenses found"
+                print(f"{email}: {status}")
+                continue
             result = issue(
                 api_base=args.api_base,
                 api_key=api_key,

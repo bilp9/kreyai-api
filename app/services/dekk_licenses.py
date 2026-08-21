@@ -253,6 +253,7 @@ def issue_dekk_partner_license(
         {
             "license_name": "Linguist Partner License",
             "program": "kreyai_linguist_partner",
+            "participant_id": normalized_participant_id,
             "cohort": str(cohort or "2026").strip(),
             "max_devices": 2,
         }
@@ -276,6 +277,37 @@ def issue_dekk_partner_license(
     }
     doc_ref.set(record)
     return {**record, "applied": True}
+
+
+def revoke_dekk_partner_license(
+    *, participant_id: str, revoked_by: str | None = None, reason: str | None = None
+) -> dict[str, Any]:
+    """Record revocation; distributed Dekk keys remain offline-verifiable."""
+    normalized_participant_id = str(participant_id or "").strip()
+    if not normalized_participant_id:
+        raise ValueError("A participant ID is required.")
+
+    doc_ref = db.collection(LICENSE_COLLECTION).document(f"partner_{normalized_participant_id}")
+    snap = doc_ref.get()
+    if not snap.exists:
+        return {"found": False, "revoked": False, "enforcement": "administrative_offline"}
+
+    record = snap.to_dict() or {}
+    record.update(
+        {
+            "status": "revoked",
+            "revoked_by": str(revoked_by or "").strip() or None,
+            "revocation_reason": str(reason or "").strip() or None,
+            "revoked_at": firestore.SERVER_TIMESTAMP,
+        }
+    )
+    doc_ref.set(record)
+    return {
+        "found": True,
+        "revoked": True,
+        "license_id": str(record.get("license_id") or ""),
+        "enforcement": "administrative_offline",
+    }
 
 
 def record_dekk_download_event(

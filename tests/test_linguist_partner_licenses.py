@@ -107,3 +107,35 @@ def test_partner_license_route_can_resend_existing_key(monkeypatch):
     assert response["products"]["atelier"]["issued"] is False
     assert "EXISTING-SECRET" not in str(response)
     assert emails[0]["licenses"] == {"atelier": "EXISTING-SECRET"}
+
+
+def test_partner_revoke_route_records_product_specific_enforcement(monkeypatch):
+    monkeypatch.setattr(
+        ops,
+        "revoke_atelier_partner_license",
+        lambda **kwargs: {"found": True, "revoked": True, "license_id": "atelier-id"},
+    )
+    monkeypatch.setattr(
+        ops,
+        "revoke_dekk_partner_license",
+        lambda **kwargs: {
+            "found": True,
+            "revoked": True,
+            "license_id": "dekk-id",
+            "enforcement": "administrative_offline",
+        },
+    )
+
+    response = ops.revoke_linguist_partner_license_route(
+        ops.LinguistPartnerRevokeRequest(
+            email="Partner@Example.com",
+            cohort="2026",
+            reason="Program misuse",
+        ),
+        User(id="ops-user", email="owner@example.com"),
+    )
+
+    assert response["email"] == "partner@example.com"
+    assert response["products"]["atelier"]["revoked"] is True
+    assert response["products"]["dekk"]["enforcement"] == "administrative_offline"
+    assert "license_key" not in str(response)
