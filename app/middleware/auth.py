@@ -23,6 +23,7 @@ PUBLIC_EXACT_PATHS = {
     "/api/dekk/config",
     "/api/dekk/checkout-session",
     "/api/dekk/download-event",
+    "/api/linguist-partner/apply",
 }
 
 

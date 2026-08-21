@@ -93,6 +93,30 @@ async def _send_emails(to_emails: list[str], subject: str, html: str):
             print(f"📧 Internal notification sent to {', '.join(to_emails)}")
 
 
+async def send_linguist_partner_application_email(application: dict) -> None:
+    safe_name = escape(str(application.get("name") or ""))
+    safe_email = escape(str(application.get("email") or ""))
+    products = ", ".join(escape(str(item)) for item in application.get("products") or [])
+    application_id = escape(str(application.get("application_id") or ""))
+    html = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.6; color:#111;">
+      <h2>New Linguist Partner application</h2>
+      <p><strong>{safe_name}</strong> submitted an application.</p>
+      <ul>
+        <li><strong>Email:</strong> {safe_email}</li>
+        <li><strong>Products:</strong> {products}</li>
+        <li><strong>Application ID:</strong> {application_id}</li>
+      </ul>
+      <p>Review the complete pending application in the KreyAI operations data.</p>
+    </div>
+    """
+    await _send_emails(
+        INTERNAL_SALES_NOTIFICATION_EMAILS,
+        f"Linguist Partner application — {safe_name}",
+        html,
+    )
+
+
 # -------------------------------------------------
 # Verification Email
 # -------------------------------------------------

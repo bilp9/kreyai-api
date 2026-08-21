@@ -28,8 +28,20 @@ from app.state.firestore_jobs import count_jobs_by_field, count_jobs_by_status, 
 from app.state.firestore_jobs import get_job as fs_get_job, update_job as fs_update_job
 from app.services.ht_llm_review import DEFAULT_PROMPT
 from app.services.ht_review_jobs import run_ht_review_job, start_ht_review_job
+from app.services.linguist_partner_applications import list_linguist_partner_applications
 
 router = APIRouter(prefix="/ops", tags=["ops"])
+
+
+@router.get("/linguist-partner-applications")
+def get_linguist_partner_applications(
+    limit: int = Query(default=50, ge=1, le=200),
+    user: User = Depends(get_current_user),
+):
+    return {
+        "viewer": {"id": user.id, "email": user.email},
+        "applications": list_linguist_partner_applications(limit=limit),
+    }
 
 
 class PartnerPlanRequest(BaseModel):
