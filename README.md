@@ -61,3 +61,7 @@ Important production checks:
 - Smoke-test job creation, upload, processing, downloads, and immediate deletion.
 
 See `docs/ops/retention.md` for storage-retention enforcement.
+
+## Internal Programs
+
+The operational runbook for complimentary Linguist Partner licenses is in [`docs/linguist-partner-program.md`](docs/linguist-partner-program.md). Keep participant lists, application exports, API keys, and license keys outside the repository.

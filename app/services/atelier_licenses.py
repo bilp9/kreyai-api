@@ -43,6 +43,14 @@ ATELIER_PLANS: Dict[str, AtelierPlan] = {
     ),
 }
 
+ATELIER_PARTNER_PLAN = AtelierPlan(
+    id="linguist_partner",
+    name="aTelier Linguist Partner",
+    price_cents=0,
+    label="Complimentary",
+    description="Complimentary permanent aTelier license for the KreyAI Linguist Partner Program.",
+)
+
 
 def _frontend_base_url() -> str:
     return os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
@@ -85,6 +93,8 @@ def list_atelier_plans() -> List[Dict[str, object]]:
 def get_atelier_plan(plan_id: str) -> AtelierPlan:
     normalized = str(plan_id or "").strip().lower()
     plan = ATELIER_PLANS.get(normalized)
+    if normalized == ATELIER_PARTNER_PLAN.id:
+        plan = ATELIER_PARTNER_PLAN
     if not plan:
         raise ValueError("Unknown aTelier plan")
     return plan
@@ -234,6 +244,90 @@ def issue_atelier_license_for_checkout(
     return {**record, "applied": True}
 
 
+def issue_atelier_partner_license(
+    *,
+    participant_id: str,
+    email: str,
+    participant_name: str | None = None,
+    cohort: str = "2026",
+    issued_by: str | None = None,
+) -> dict[str, Any]:
+    """Issue an idempotent complimentary production license without Stripe."""
+    normalized_email = normalize_billing_email(email)
+    if not is_valid_billing_email(normalized_email):
+        raise ValueError("A valid email is required.")
+
+    normalized_participant_id = str(participant_id or "").strip()
+    if not normalized_participant_id:
+        raise ValueError("A participant ID is required.")
+
+    plan = ATELIER_PARTNER_PLAN
+    record_id = f"partner_{normalized_participant_id}"
+    doc_ref = db.collection(LICENSE_COLLECTION).document(record_id)
+    snap = doc_ref.get()
+    if snap.exists:
+        data = snap.to_dict() or {}
+        return {**data, "applied": False}
+
+    payload = make_license_payload(email=normalized_email, plan_id=plan.id)
+    payload.update(
+        {
+            "license_name": "Linguist Partner License",
+            "program": "kreyai_linguist_partner",
+            "participant_id": normalized_participant_id,
+            "cohort": str(cohort or "2026").strip(),
+            "max_devices": 2,
+        }
+    )
+    license_key = sign_license_payload(payload)
+    record = {
+        "email": normalized_email,
+        "participant_name": str(participant_name or "").strip() or None,
+        "participant_id": normalized_participant_id,
+        "program": "kreyai_linguist_partner",
+        "cohort": payload["cohort"],
+        "source": "complimentary_partner_program",
+        "issued_by": str(issued_by or "").strip() or None,
+        "plan": plan.id,
+        "plan_name": plan.name,
+        "license_id": payload["license_id"],
+        "license_key": license_key,
+        "payload": payload,
+        "amount_total": 0,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+    doc_ref.set(record)
+    return {**record, "applied": True}
+
+
+def revoke_atelier_partner_license(
+    *, participant_id: str, revoked_by: str | None = None, reason: str | None = None
+) -> dict[str, Any]:
+    normalized_participant_id = str(participant_id or "").strip()
+    if not normalized_participant_id:
+        raise ValueError("A participant ID is required.")
+
+    doc_ref = db.collection(LICENSE_COLLECTION).document(f"partner_{normalized_participant_id}")
+    snap = doc_ref.get()
+    if not snap.exists:
+        return {"found": False, "revoked": False}
+
+    record = snap.to_dict() or {}
+    record.update(
+        {
+            "status": "revoked",
+            "revoked_by": str(revoked_by or "").strip() or None,
+            "revocation_reason": str(reason or "").strip() or None,
+            "revoked_at": firestore.SERVER_TIMESTAMP,
+        }
+    )
+    doc_ref.set(record)
+    license_id = str(record.get("license_id") or "").strip()
+    if license_id:
+        db.collection(ACTIVATION_COLLECTION).document(license_id).delete()
+    return {"found": True, "revoked": True, "license_id": license_id}
+
+
 def activate_atelier_license(*, license_key: str, machine_id: str) -> dict[str, Any]:
     machine_id = str(machine_id or "").strip()
     if not machine_id:
@@ -243,21 +337,42 @@ def activate_atelier_license(*, license_key: str, machine_id: str) -> dict[str, 
     if payload is None:
         return {"valid": False, "error": "Invalid license key."}
 
+    if payload.get("plan") == ATELIER_PARTNER_PLAN.id:
+        participant_id = str(payload.get("participant_id") or "").strip()
+        if not participant_id:
+            return {"valid": False, "error": "This partner license must be reissued. Contact support."}
+        partner_snap = db.collection(LICENSE_COLLECTION).document(f"partner_{participant_id}").get()
+        partner_record = partner_snap.to_dict() if partner_snap.exists else {}
+        if not partner_snap.exists or (partner_record or {}).get("status") == "revoked":
+            return {"valid": False, "error": "This partner license is no longer active. Contact support."}
+
     license_id = payload["license_id"]
     doc_ref = db.collection(ACTIVATION_COLLECTION).document(license_id)
     snap = doc_ref.get()
+    max_devices = max(1, int(payload.get("max_devices") or 1))
     if snap.exists:
         data = snap.to_dict() or {}
-        if data.get("machine_id") and data.get("machine_id") != machine_id:
+        active_machines = [str(value) for value in data.get("machine_ids", []) if value]
+        legacy_machine = str(data.get("machine_id") or "").strip()
+        if legacy_machine and legacy_machine not in active_machines:
+            active_machines.insert(0, legacy_machine)
+        if machine_id not in active_machines and len(active_machines) >= max_devices:
             return {
                 "valid": False,
-                "error": "This license is already active on another machine. Deactivate it there first, or contact support to transfer it.",
+                "error": f"This license is already active on {max_devices} computer{'s' if max_devices != 1 else ''}. Deactivate one first, or contact support to transfer it.",
             }
+    else:
+        active_machines = []
+
+    if machine_id not in active_machines:
+        active_machines.append(machine_id)
 
     doc_ref.set(
         {
             "license_id": license_id,
-            "machine_id": machine_id,
+            "machine_id": active_machines[0],
+            "machine_ids": active_machines,
+            "max_devices": max_devices,
             "email": payload.get("email"),
             "plan": payload.get("plan"),
             "activated_at": firestore.SERVER_TIMESTAMP,
@@ -279,8 +394,23 @@ def deactivate_atelier_license(*, license_key: str, machine_id: str) -> dict[str
         return {"valid": True, "deactivated": False}
 
     data = snap.to_dict() or {}
-    if data.get("machine_id") != machine_id:
+    active_machines = [str(value) for value in data.get("machine_ids", []) if value]
+    legacy_machine = str(data.get("machine_id") or "").strip()
+    if legacy_machine and legacy_machine not in active_machines:
+        active_machines.insert(0, legacy_machine)
+    if machine_id not in active_machines:
         return {"valid": False, "error": "This license is not active on this machine."}
 
-    doc_ref.delete()
+    remaining = [value for value in active_machines if value != machine_id]
+    if remaining:
+        doc_ref.set(
+            {
+                **data,
+                "machine_id": remaining[0],
+                "machine_ids": remaining,
+                "deactivated_at": firestore.SERVER_TIMESTAMP,
+            }
+        )
+    else:
+        doc_ref.delete()
     return {"valid": True, "deactivated": True}
