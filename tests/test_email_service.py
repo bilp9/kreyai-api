@@ -93,3 +93,28 @@ def test_internal_license_sale_email_excludes_license_key(monkeypatch):
     assert "cs_test_123" in sent["html"]
     assert "dekk_abc123" in sent["html"]
     assert "license key is intentionally excluded" in sent["html"]
+
+
+def test_linguist_partner_email_contains_both_product_keys(monkeypatch):
+    sent = {}
+
+    async def fake_send_email(to_email, subject, html):
+        sent.update(to_email=to_email, subject=subject, html=html)
+
+    monkeypatch.setattr(email_service, "FRONTEND_BASE_URL", "https://www.kreyai.com")
+    monkeypatch.setattr(email_service, "_send_email", fake_send_email)
+
+    asyncio.run(
+        email_service.send_linguist_partner_license_email(
+            email="partner@example.com",
+            participant_name="Marie Test",
+            licenses={"atelier": "ATELIER-KEY", "dekk": "DEKK-KEY"},
+        )
+    )
+
+    assert sent["to_email"] == "partner@example.com"
+    assert sent["subject"] == "Your KreyAI Linguist Partner licenses"
+    assert "Marie Test" in sent["html"]
+    assert "ATELIER-KEY" in sent["html"]
+    assert "DEKK-KEY" in sent["html"]
+    assert "complimentary" in sent["html"]

@@ -40,6 +40,18 @@ def test_sign_and_verify_round_trip(test_keypair):
     assert verified["product"] == al.PRODUCT_ID
 
 
+def test_partner_payload_is_signed_and_not_publicly_listed(test_keypair):
+    payload = al.make_license_payload(email="partner@example.com", plan_id="linguist_partner")
+    payload.update({"license_name": "Linguist Partner License", "max_devices": 2})
+    verified = al.verify_license_key(al.sign_license_payload(payload))
+
+    assert verified is not None
+    assert verified["plan"] == "linguist_partner"
+    assert verified["license_name"] == "Linguist Partner License"
+    assert verified["max_devices"] == 2
+    assert all(plan["id"] != "linguist_partner" for plan in al.list_atelier_plans())
+
+
 def test_verify_rejects_tampered_payload(test_keypair):
     payload = al.make_license_payload(email="translator@example.com", plan_id="classic")
     license_key = al.sign_license_payload(payload)
@@ -63,3 +75,74 @@ def test_verify_rejects_wrong_product_prefix(test_keypair):
     forged_prefix = "DEKK1" + license_key[len(al.LICENSE_PREFIX):]
 
     assert al.verify_license_key(forged_prefix) is None
+
+
+class _FakeSnapshot:
+    def __init__(self, data):
+        self._data = data
+        self.exists = data is not None
+
+    def to_dict(self):
+        return dict(self._data or {})
+
+
+class _FakeDocument:
+    def __init__(self, store, key):
+        self.store = store
+        self.key = key
+
+    def get(self):
+        return _FakeSnapshot(self.store.get(self.key))
+
+    def set(self, value):
+        self.store[self.key] = dict(value)
+
+    def delete(self):
+        self.store.pop(self.key, None)
+
+
+class _FakeCollection:
+    def __init__(self, store):
+        self.store = store
+
+    def document(self, key):
+        return _FakeDocument(self.store, key)
+
+
+class _FakeDB:
+    def __init__(self):
+        self.collections = {}
+
+    def collection(self, name):
+        return _FakeCollection(self.collections.setdefault(name, {}))
+
+
+def test_partner_license_allows_two_computers_and_rejects_third(monkeypatch, test_keypair):
+    fake_db = _FakeDB()
+    monkeypatch.setattr(al, "db", fake_db)
+    payload = al.make_license_payload(email="partner@example.com", plan_id="linguist_partner")
+    payload["max_devices"] = 2
+    key = al.sign_license_payload(payload)
+
+    assert al.activate_atelier_license(license_key=key, machine_id="mac-one")["valid"] is True
+    assert al.activate_atelier_license(license_key=key, machine_id="mac-two")["valid"] is True
+    third = al.activate_atelier_license(license_key=key, machine_id="mac-three")
+
+    assert third["valid"] is False
+    assert "2 computers" in third["error"]
+
+
+def test_partner_deactivation_frees_one_computer_slot(monkeypatch, test_keypair):
+    fake_db = _FakeDB()
+    monkeypatch.setattr(al, "db", fake_db)
+    payload = al.make_license_payload(email="partner@example.com", plan_id="linguist_partner")
+    payload["max_devices"] = 2
+    key = al.sign_license_payload(payload)
+
+    al.activate_atelier_license(license_key=key, machine_id="mac-one")
+    al.activate_atelier_license(license_key=key, machine_id="mac-two")
+    assert al.deactivate_atelier_license(license_key=key, machine_id="mac-one") == {
+        "valid": True,
+        "deactivated": True,
+    }
+    assert al.activate_atelier_license(license_key=key, machine_id="mac-three")["valid"] is True

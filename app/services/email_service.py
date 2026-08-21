@@ -401,6 +401,61 @@ async def send_atelier_license_email(
     )
 
 
+async def send_linguist_partner_license_email(
+    *,
+    email: str,
+    participant_name: str | None,
+    licenses: dict[str, str],
+):
+    safe_name = escape(str(participant_name or "").strip())
+    greeting = f"Hello {safe_name}," if safe_name else "Hello,"
+    product_sections = []
+
+    if licenses.get("atelier"):
+        product_sections.append(
+            f"""
+      <h3 style="margin-bottom:6px;">aTelier</h3>
+      <p style="margin-top:0;">Activate from <strong>Settings &gt; License</strong>.</p>
+      <pre style="white-space:pre-wrap;background:#f4f6fb;border:1px solid #d9def1;border-radius:8px;padding:12px;font-size:13px;line-height:1.5;">{escape(licenses['atelier'])}</pre>
+            """
+        )
+
+    if licenses.get("dekk"):
+        product_sections.append(
+            f"""
+      <h3 style="margin-bottom:6px;">Dekk</h3>
+      <p style="margin-top:0;">Open <strong>License</strong> in Dekk and paste the key below.</p>
+      <pre style="white-space:pre-wrap;background:#f4f6fb;border:1px solid #d9def1;border-radius:8px;padding:12px;font-size:13px;line-height:1.5;">{escape(licenses['dekk'])}</pre>
+            """
+        )
+
+    html_content = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.6; color:#111;">
+      <h2>Welcome to the KreyAI Linguist Partner Program</h2>
+      <p>{greeting}</p>
+      <p>
+        Thank you for helping us improve professional language tools. Your complimentary
+        Linguist Partner licenses are permanent and intended for your own use.
+      </p>
+
+      {''.join(product_sections)}
+
+      <p>
+        Downloads and product information are available at
+        <a href="{FRONTEND_BASE_URL}">kreyai.com</a>.
+      </p>
+      <p>If you need help, reply to this email or contact <a href="mailto:support@kreyai.com">support@kreyai.com</a>.</p>
+      <p style="font-size:13px; color:#777;">Keep this email for your records and do not share your license keys.</p>
+    </div>
+    """
+
+    await _send_email(
+        email,
+        "Your KreyAI Linguist Partner licenses",
+        html_content,
+    )
+
+
 async def send_internal_license_sale_email(
     *,
     product_name: str,

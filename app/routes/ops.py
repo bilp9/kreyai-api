@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from dataclasses import asdict
+import hashlib
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -12,7 +13,10 @@ from app.constants import JobStatus
 from app.models.user import User
 from app.services.access_control import resolve_submission_access, serialize_access_decision
 from app.services.credits import adjust_credit_minutes, ensure_starter_credit_grant, get_credit_account, list_credit_ledger
+from app.services.atelier_licenses import issue_atelier_partner_license
+from app.services.dekk_licenses import issue_dekk_partner_license
 from app.services.docx_export import build_docx_bytes
+from app.services.email_service import send_linguist_partner_license_email
 from app.services.partner_plans import (
     get_partner_plan_status,
     grant_partner_plan,
@@ -31,6 +35,13 @@ router = APIRouter(prefix="/ops", tags=["ops"])
 class PartnerPlanRequest(BaseModel):
     email: str
     notes: Optional[str] = None
+
+
+class LinguistPartnerLicenseRequest(BaseModel):
+    email: str
+    name: Optional[str] = None
+    cohort: str = "2026"
+    products: List[str] = Field(default_factory=lambda: ["atelier", "dekk"])
 
 
 class BillingAdjustmentRequest(BaseModel):
@@ -55,6 +66,77 @@ def _normalize_email(email: str) -> str:
     if not normalized or "@" not in normalized:
         raise HTTPException(status_code=400, detail="A valid email is required.")
     return normalized
+
+
+def _linguist_partner_id(*, email: str, cohort: str) -> str:
+    value = f"{cohort.strip().lower()}:{email.strip().lower()}".encode("utf-8")
+    return hashlib.sha256(value).hexdigest()[:20]
+
+
+@router.post("/licenses/linguist-partner")
+async def issue_linguist_partner_license_route(
+    payload: LinguistPartnerLicenseRequest,
+    user: User = Depends(get_current_user),
+):
+    email = _normalize_email(payload.email)
+    cohort = str(payload.cohort or "2026").strip() or "2026"
+    products = list(dict.fromkeys(str(item or "").strip().lower() for item in payload.products))
+    if not products or any(product not in {"atelier", "dekk"} for product in products):
+        raise HTTPException(status_code=400, detail="Products must include aTelier, Dekk, or both.")
+
+    participant_id = _linguist_partner_id(email=email, cohort=cohort)
+    issued_by = user.email or user.id
+    results: dict[str, dict[str, Any]] = {}
+    licenses_to_email: dict[str, str] = {}
+
+    try:
+        if "atelier" in products:
+            result = issue_atelier_partner_license(
+                participant_id=participant_id,
+                email=email,
+                participant_name=payload.name,
+                cohort=cohort,
+                issued_by=issued_by,
+            )
+            results["atelier"] = result
+            if result.get("applied"):
+                licenses_to_email["atelier"] = str(result.get("license_key") or "")
+
+        if "dekk" in products:
+            result = issue_dekk_partner_license(
+                participant_id=participant_id,
+                email=email,
+                participant_name=payload.name,
+                cohort=cohort,
+                issued_by=issued_by,
+            )
+            results["dekk"] = result
+            if result.get("applied"):
+                licenses_to_email["dekk"] = str(result.get("license_key") or "")
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if licenses_to_email:
+        await send_linguist_partner_license_email(
+            email=email,
+            participant_name=payload.name,
+            licenses=licenses_to_email,
+        )
+
+    return {
+        "participant_id": participant_id,
+        "email": email,
+        "cohort": cohort,
+        "products": {
+            product: {
+                "license_id": str(result.get("license_id") or ""),
+                "issued": bool(result.get("applied")),
+            }
+            for product, result in results.items()
+        },
+        "email_sent": bool(licenses_to_email),
+        "issued_by": issued_by,
+    }
 
 
 def _average(values: List[float]) -> float | None:

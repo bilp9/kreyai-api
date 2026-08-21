@@ -49,6 +49,14 @@ DEKK_PLANS: Dict[str, DekkPlan] = {
     ),
 }
 
+DEKK_PARTNER_PLAN = DekkPlan(
+    id="linguist_partner",
+    name="Dekk Linguist Partner",
+    price_cents=0,
+    label="Complimentary",
+    description="Complimentary permanent Dekk license for the KreyAI Linguist Partner Program.",
+)
+
 
 def _frontend_base_url() -> str:
     return os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
@@ -91,6 +99,8 @@ def list_dekk_plans() -> List[Dict[str, object]]:
 def get_dekk_plan(plan_id: str) -> DekkPlan:
     normalized = str(plan_id or "").strip().lower()
     plan = DEKK_PLANS.get(normalized)
+    if normalized == DEKK_PARTNER_PLAN.id:
+        plan = DEKK_PARTNER_PLAN
     if not plan:
         raise ValueError("Unknown Dekk plan")
     return plan
@@ -207,6 +217,61 @@ def issue_dekk_license_for_checkout(
         "stripe_session_id": session_id,
         "stripe_customer_id": stripe_customer_id,
         "amount_total": amount_total,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+    doc_ref.set(record)
+    return {**record, "applied": True}
+
+
+def issue_dekk_partner_license(
+    *,
+    participant_id: str,
+    email: str,
+    participant_name: str | None = None,
+    cohort: str = "2026",
+    issued_by: str | None = None,
+) -> dict[str, Any]:
+    """Issue an idempotent complimentary production license without Stripe."""
+    normalized_email = normalize_billing_email(email)
+    if not is_valid_billing_email(normalized_email):
+        raise ValueError("A valid email is required.")
+
+    normalized_participant_id = str(participant_id or "").strip()
+    if not normalized_participant_id:
+        raise ValueError("A participant ID is required.")
+
+    plan = DEKK_PARTNER_PLAN
+    record_id = f"partner_{normalized_participant_id}"
+    doc_ref = db.collection(LICENSE_COLLECTION).document(record_id)
+    snap = doc_ref.get()
+    if snap.exists:
+        data = snap.to_dict() or {}
+        return {**data, "applied": False}
+
+    payload = make_license_payload(email=normalized_email, plan_id=plan.id, seats=2)
+    payload.update(
+        {
+            "license_name": "Linguist Partner License",
+            "program": "kreyai_linguist_partner",
+            "cohort": str(cohort or "2026").strip(),
+            "max_devices": 2,
+        }
+    )
+    license_key = sign_license_payload(payload)
+    record = {
+        "email": normalized_email,
+        "participant_name": str(participant_name or "").strip() or None,
+        "participant_id": normalized_participant_id,
+        "program": "kreyai_linguist_partner",
+        "cohort": payload["cohort"],
+        "source": "complimentary_partner_program",
+        "issued_by": str(issued_by or "").strip() or None,
+        "plan": plan.id,
+        "plan_name": plan.name,
+        "license_id": payload["license_id"],
+        "license_key": license_key,
+        "payload": payload,
+        "amount_total": 0,
         "created_at": firestore.SERVER_TIMESTAMP,
     }
     doc_ref.set(record)
